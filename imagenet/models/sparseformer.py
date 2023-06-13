@@ -1,6 +1,6 @@
 # --------------------------------------------------------
 # SparseFormer
-# Copyright 2021 Ziteng Gao
+# Copyright 2023 Ziteng Gao
 # Licensed under The MIT License
 # Written by Ziteng Gao
 # --------------------------------------------------------
