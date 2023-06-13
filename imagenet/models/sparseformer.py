@@ -1,0 +1,597 @@
+# --------------------------------------------------------
+# SparseFormer
+# Copyright 2021 Ziteng Gao
+# Licensed under The MIT License
+# Written by Ziteng Gao
+# --------------------------------------------------------
+
+from functools import partial
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+LAYER_NORM = partial(nn.LayerNorm, eps=1e-6)
+
+
+@torch.no_grad()
+def init_layer_norm_unit_norm(layer: nn.LayerNorm, gamma=1.0):
+    assert len(layer.normalized_shape) == 1
+    width = layer.normalized_shape[0]
+    nn.init.ones_(layer.weight)
+    layer.weight.data.mul_(gamma * (width ** -0.5))
+
+
+@torch.no_grad()
+def init_linear_params(weight, bias):
+    std = .02
+    nn.init.trunc_normal_(weight, std=std)
+    if bias is not None:
+        nn.init.constant_(bias, 0)
+
+
+class RestrictGradNorm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, norm=0.1):
+        ctx.norm = norm
+        ctx.save_for_backward(x)
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        norm = ctx.norm
+        grad_x = grad_output.clone().clamp(-norm, norm)
+        return grad_x, None
+
+
+def drop_path(x, drop_prob: float = 0., training: bool = False):
+    """
+    Copyright 2020 Ross Wightman
+    """
+    """
+    Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
+    This is the same as the DropConnect impl I created for EfficientNet, etc networks, however,
+    the original name is misleading as 'Drop Connect' is a different form of dropout in a separate paper...
+    See discussion: https://github.com/tensorflow/tpu/issues/494#issuecomment-532968956 ... I've opted for
+    changing the layer and argument names to 'drop path' rather than mix DropConnect as a layer name and use
+    'survival rate' as the argument.
+    """
+    if drop_prob == 0. or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    # work with diff dim tensors, not just 2D ConvNets
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = keep_prob + \
+        torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor.floor_()  # binarize
+    output = x.div(keep_prob) * random_tensor
+    return output
+
+
+class DropPath(nn.Module):
+    """
+    Copyright 2020 Ross Wightman
+    """
+    """
+    Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
+    """
+
+    def __init__(self, drop_prob=None):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training)
+
+
+def roi_adjust(token_roi: torch.Tensor, token_adjust: torch.Tensor):
+    token_xy = (token_roi[..., 2:]+token_roi[..., :2]) * 0.5
+    token_wh = (token_roi[..., 2:]-token_roi[..., :2]).abs()
+
+    token_xy = token_xy + token_adjust[..., :2]*token_wh
+    token_wh = token_wh * token_adjust[..., 2:].exp()
+
+    token_roi_new = torch.cat(
+        [token_xy-0.5*token_wh, token_xy+0.5*token_wh], dim=-1)
+    return token_roi_new
+
+
+def map_to_absolute_coordinates(
+        token_roi: torch.Tensor,
+        offset: torch.Tensor,
+        num_heads: int,
+        num_points: int):
+    batch, num_tokens, _ = offset.shape
+
+    offset = offset.view(batch, num_tokens, 1, num_heads*num_points, 2)
+
+    offset_mean = offset.mean(-2, keepdim=True)
+    offset_std = offset.std(-2, keepdim=True)+1e-7
+    offset = (offset - offset_mean)/(3*offset_std)
+
+    offset = offset.view(batch, num_tokens, 1, num_heads*num_points, 2)
+
+    token_xy = (token_roi[:, :, 2:]+token_roi[:, :, :2])/2.0
+    roi_wh = token_roi[:, :, 2:]-token_roi[:, :, :2]
+    offset_xy = offset[..., :2] * \
+        roi_wh.view(batch, num_tokens, 1, 1, 2)
+    sample_yx = token_xy.view(batch, num_tokens, 1, 1, 2) \
+        + offset_xy
+
+    return sample_yx
+
+
+def conv3x3(in_planes, out_planes, stride=1, dilation=1):
+    """3x3 convolution with padding"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=dilation, dilation=dilation, bias=False)
+
+
+def conv1x1(in_planes, out_planes, stride=1):
+    """1x1 convolution"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+
+
+def feat_sampling_2d(
+        sample_points: torch.Tensor,
+        value: torch.Tensor,
+        n_points=1):
+    batch, Hq, Wq, num_points_per_head, _ = sample_points.shape
+    batch, channel, height, width = value.shape
+
+    n_heads = num_points_per_head//n_points
+
+    sample_points = sample_points.view(batch, Hq, Wq, n_heads, n_points, 2) \
+        .permute(0, 3, 1, 2, 4, 5).contiguous().flatten(0, 1)
+    sample_points = RestrictGradNorm.apply(sample_points, 1.0/height)
+    sample_points = sample_points.flatten(2, 3)
+    sample_points = sample_points*2.0-1.0
+    value = value.view(batch*n_heads, channel//n_heads, height, width)
+    out = F.grid_sample(
+        value, sample_points,
+        mode='bilinear', padding_mode='zeros', align_corners=False,
+    )
+
+    out = out.view(batch, n_heads, channel//n_heads, Hq, Wq, n_points)
+
+    return out.permute(0, 3, 4, 1, 5, 2).flatten(1, 2)
+
+
+def layer_norm_by_dim(x: torch.Tensor, dim=-1):
+    mean = x.mean(dim, keepdim=True)
+    x = x - mean
+    std = (x.var(dim=dim, keepdim=True)+1e-7).sqrt()
+    return x/std
+
+
+class AdaptiveMixing(nn.Module):
+    def __init__(self, in_dim, in_points, n_groups, query_dim=None,
+                 out_dim=None, out_points=None, out_query_dim=None):
+        super(AdaptiveMixing, self).__init__()
+        out_dim = out_dim if out_dim is not None else in_dim
+        out_points = out_points if out_points is not None else in_points
+        query_dim = query_dim if query_dim is not None else in_dim
+        out_query_dim = out_query_dim if out_query_dim is not None else query_dim
+
+        self.query_dim = query_dim
+        self.out_query_dim = out_query_dim
+        self.in_dim = in_dim
+        self.in_points = in_points
+        self.n_groups = n_groups
+        self.out_dim = out_dim
+        self.out_points = out_points
+
+        self.eff_in_dim = in_dim//n_groups
+        self.eff_out_dim = self.eff_in_dim
+
+        self.m_parameters = (self.eff_in_dim * self.eff_out_dim)
+        self.s_parameters = (self.in_points * self.out_points)
+
+        self.total_parameters = self.m_parameters + self.s_parameters
+
+        self.parameter_generator = nn.Sequential(
+            LAYER_NORM(self.query_dim),
+            nn.Linear(self.query_dim, self.query_dim//4),
+            nn.Linear(self.query_dim//4, self.total_parameters*self.n_groups),
+        )
+
+        self.m_beta = nn.Parameter(torch.zeros(self.eff_out_dim))
+        self.s_beta = nn.Parameter(torch.zeros(self.out_points))
+
+        self.tuo_proj = nn.Linear(n_groups*self.eff_out_dim*self.out_points,
+                                  self.out_query_dim)
+
+        self.act = nn.GELU()
+
+    @torch.no_grad()
+    def init_layer(self):
+        init_layer_norm_unit_norm(self.parameter_generator[0], gamma=1.)
+        nn.init.zeros_(self.parameter_generator[-1].weight)
+
+        bias = self.parameter_generator[-1].bias
+        nn.init.xavier_uniform_(
+            bias[:self.eff_in_dim*self.eff_out_dim].view(
+                self.eff_in_dim, self.eff_out_dim), gain=1
+        )
+        nn.init.xavier_uniform_(
+            bias[self.eff_in_dim*self.eff_out_dim:].view(
+                self.in_points, self.out_points), gain=1
+        )
+
+    def forward(self, x, query):
+        B, N, g, P, C = x.size()
+        assert g == 1
+        # batch, num_query, group, point, channel
+        G = self.n_groups
+        tuo = x.reshape(B*N*self.n_groups, P, C)
+
+        params: torch.Tensor = self.parameter_generator(query)
+        params = params.reshape(B*N*G, -1)
+
+        M, S = params.split_with_sizes(
+            [self.eff_in_dim*self.eff_out_dim, self.out_points*self.in_points],
+            dim=-1
+        )
+
+        M = M.reshape(B*N*G, self.eff_in_dim, self.eff_out_dim)
+        S = S.reshape(B*N*G, self.out_points, self.in_points)
+        m_beta = self.m_beta.view(1, 1, self.eff_out_dim)
+        s_beta = self.s_beta.view(1, self.out_points, 1)
+
+        tuo = torch.baddbmm(m_beta, tuo, M)
+        tuo = self.act(tuo)
+
+        tuo = torch.baddbmm(s_beta, S, tuo)
+        tuo = self.act(tuo)
+
+        tuo = tuo.reshape(B, N, -1)
+        tuo = self.tuo_proj(tuo)
+
+        return tuo
+
+
+class SFUnit(nn.Module):
+    def __init__(self,
+                 dim,
+                 conv_dim,
+                 num_sampling_points,
+                 sampling_enabled=False,
+                 adjusting_enabled=False,
+                 final_adjusting=False,
+                 mlp_ratio=4,
+                 repeats=1,
+                 drop_path=0.0):
+        super(SFUnit, self).__init__()
+        self.dim = dim
+        self.conv_dim = dim
+
+        self.num_sampling_points = num_sampling_points
+
+        self.sampling_enabled = sampling_enabled
+        self.adjusting_enabled = adjusting_enabled
+        self.final_adjusting = final_adjusting
+        self.repeats = repeats
+
+        if self.sampling_enabled:
+            self.adaptive_mixing = AdaptiveMixing(
+                conv_dim, num_sampling_points, 1, query_dim=dim, out_query_dim=dim
+            )
+        else:
+            self.adaptive_mixing = None
+
+        self.ffn = nn.Sequential(
+            LAYER_NORM(dim),
+            nn.Linear(dim, dim*mlp_ratio),
+            nn.GELU(),
+            nn.Linear(dim*mlp_ratio, dim),
+        )
+
+        self.attn = nn.MultiheadAttention(
+            dim,
+            64 if dim >= 64 else dim,
+            dropout=0.0
+        )
+
+        self.ln_attn = LAYER_NORM(dim)
+
+        if self.sampling_enabled:
+            self.roi_offset_module = nn.Sequential(
+                LAYER_NORM(dim),
+                nn.Linear(dim, num_sampling_points*2, bias=False),
+            )
+            self.roi_offset_bias = nn.Parameter(
+                torch.randn(num_sampling_points*2))
+
+        if self.adjusting_enabled or self.final_adjusting:
+            self.roi_adjust_module = nn.Sequential(
+                LAYER_NORM(dim),
+                nn.Linear(dim, 4, bias=False),
+            )
+        self.drop_path = drop_path
+        self.dropout = DropPath(
+            drop_path if isinstance(drop_path, (float, int)) else .0
+        )
+
+    @torch.no_grad()
+    def init_layer(self):
+        init_linear_params(self.attn.in_proj_weight, self.attn.in_proj_bias)
+
+        if self.adjusting_enabled:
+            init_layer_norm_unit_norm(self.roi_adjust_module[0],  1.)
+            nn.init.zeros_(self.roi_adjust_module[-1].weight)
+            pass
+
+        if self.sampling_enabled:
+            init_layer_norm_unit_norm(self.roi_offset_module[0],  1.)
+            nn.init.zeros_(self.roi_adjust_module[-1].weight)
+
+            root = int(self.num_sampling_points**0.5)
+            x = torch.linspace(0.5/root, 1-0.5/root, root)\
+                .view(1, -1, 1).repeat(root, 1, 1)
+            y = torch.linspace(0.5/root, 1-0.5/root, root)\
+                .view(-1, 1, 1).repeat(1, root, 1)
+            grid = torch.cat([x, y], dim=-1).view(root**2, -1)
+            bias = self.roi_offset_bias.view(-1, 2)
+            bias.data[:root**2] = grid - 0.5
+
+    def shift_token_roi(self, token_embedding: torch.Tensor, token_roi: torch.Tensor):
+        roi_adjust_logit = self.roi_adjust_module(token_embedding)
+        roi_adjust_logit = self.dropout(roi_adjust_logit)
+        token_roi = roi_adjust(token_roi, roi_adjust_logit)
+        return token_roi
+
+    def sampling_mixing(self, feat,
+                        token_embedding: torch.Tensor, token_roi: torch.Tensor):
+        roi_offset_a = self.roi_offset_module(
+            token_embedding
+        )
+        roi_offset_base = self.roi_offset_bias.view(1, 1, -1).repeat(
+            token_embedding.size(0), token_embedding.size(1), 1)
+        roi_offset = roi_offset_base + roi_offset_a
+
+        sampling_points = map_to_absolute_coordinates(
+            token_roi.transpose(0, 1),
+            roi_offset.transpose(0, 1),
+            1,
+            self.num_sampling_points
+        )
+
+        sampled_feat = feat_sampling_2d(
+            sampling_points,
+            feat,
+            n_points=self.num_sampling_points,
+        )
+
+        src = self.adaptive_mixing(
+            sampled_feat, token_embedding.transpose(0, 1))
+        src = src.transpose(0, 1)
+        src = self.dropout(src)
+        token_embedding = token_embedding + src
+
+        return token_embedding
+
+    def ffn_forward(self, token_embedding):
+        src = self.ffn(token_embedding)
+        src = self.dropout(src)
+        token_embedding = token_embedding + src
+        return token_embedding
+
+    def self_attention_forward(self, token_embedding):
+        src = self.ln_attn(token_embedding)
+        src, _ = self.attn(src, src, src)
+        src = self.dropout(src)
+        token_embedding = token_embedding + src
+        return token_embedding
+
+    def forward_inner(self,
+                      img_feat: torch.Tensor,
+                      token_embedding: torch.Tensor,
+                      token_roi: torch.Tensor,
+                      drop_path=None,):
+        if drop_path is not None:
+            self.dropout.drop_prob = drop_path
+
+        token_embedding = self.self_attention_forward(token_embedding)
+        if self.adjusting_enabled:
+            token_roi = self.shift_token_roi(token_embedding, token_roi)
+        if self.sampling_enabled:
+            token_embedding = self.sampling_mixing(
+                img_feat, token_embedding, token_roi)
+        token_embedding = self.ffn_forward(token_embedding)
+
+        return token_embedding, token_roi
+
+    def forward(self,
+                img_feat: torch.Tensor,
+                token_embedding: torch.Tensor,
+                token_roi: torch.Tensor,
+                drop_path=None,):
+        for i in range(self.repeats):
+            drop_path = self.drop_path
+            _drop_path = drop_path if isinstance(
+                drop_path, float) else drop_path[i]
+            token_embedding, token_roi = self.forward_inner(
+                img_feat,
+                token_embedding,
+                token_roi,
+                _drop_path,
+            )
+
+        return token_embedding, token_roi
+
+
+class AvgTokenHead(nn.Module):
+    def __init__(self, in_dim, dim=0, num_classes=1000):
+        super(AvgTokenHead, self).__init__()
+        self.dim = dim
+        self.in_dim = in_dim
+        self.num_classes = num_classes
+        self.norm = LAYER_NORM(in_dim)
+        self.classifier = nn.Linear(in_dim, num_classes)
+
+    def forward(self, x):
+        x = x.mean(dim=self.dim)
+        return self.classifier(self.norm(x))
+
+
+class EarlyConvolution(nn.Module):
+    def __init__(self, conv_dim: int):
+        super(EarlyConvolution, self).__init__()
+        self.conv_dim = conv_dim
+        self.conv1 = nn.Conv2d(3, self.conv_dim,
+                               kernel_size=7, stride=2, padding=3, bias=True)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(3, 2, 1)
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(
+                    m.weight, mode='fan_out', nonlinearity='relu')
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        x = layer_norm_by_dim(x, 1)
+        return x
+
+
+class SparseFormer(nn.Module):
+    def __init__(self,
+                 conv_dim=96,
+                 num_latent_tokens=49,
+                 token_sampling_points=36,
+                 width_configurations=[256, 512],
+                 block_sizes=[1, 8],
+                 repeats=[4, 1],
+                 drop_path_rate=0.2):
+        super(SparseFormer, self).__init__()
+        self.num_latent_tokens = num_latent_tokens
+        self.width_configurations = width_configurations
+        self.block_sizes = block_sizes
+        self.repeats = repeats
+
+        self.feat_extractor = EarlyConvolution(conv_dim=conv_dim)
+
+        start_dim = width_configurations[0]
+        end_dim = width_configurations[-1]
+        self.token_roi = nn.Embedding(num_latent_tokens, 4)
+        self.token_embedding = nn.Embedding(num_latent_tokens, start_dim)
+
+        self.layers = nn.ModuleList()
+
+        # Preparing the list of drop path rate
+        nums = []
+        for i, width in enumerate(width_configurations):
+            repeat = repeats[i]
+            block_size = block_sizes[i]
+            nums += [block_size * repeat]
+        lin_drop_path = list(torch.linspace(0.0, drop_path_rate, sum(nums)))
+        lin_drop_path = [p.item() for p in lin_drop_path]
+
+        block_wise_idx = 0
+        for i, width in enumerate(width_configurations):
+            repeat = repeats[i]
+            block_size = block_sizes[i]
+            nums += [block_size * repeat]
+            if i > 0 and width_configurations[i-1] != width_configurations[i]:
+                transition = nn.Sequential(
+                    nn.Linear(
+                        width_configurations[i-1], width_configurations[i]),
+                    LAYER_NORM(width_configurations[i])
+                )
+                self.layers.append(transition)
+
+            if repeat > 1:
+                assert block_size == 1
+
+            for block_idx in range(block_size):
+                is_leading_block = (block_idx == 0)
+                module = SFUnit(
+                    width,
+                    conv_dim=conv_dim,
+                    num_sampling_points=token_sampling_points,
+                    sampling_enabled=is_leading_block,
+                    adjusting_enabled=is_leading_block,
+                    repeats=repeat,
+                    drop_path=lin_drop_path[block_wise_idx:block_wise_idx+repeat]
+                )
+                self.layers.append(module)
+                block_wise_idx += repeat
+
+        self.head = AvgTokenHead(end_dim, dim=0)
+
+        self.srnet_init()
+
+    def srnet_init(self):
+        # first recursively initialize transformer-related weights
+        def _init_transformers_weights(m):
+            if isinstance(m, nn.Linear):
+                init_linear_params(m.weight, m.bias)
+            elif isinstance(m, nn.LayerNorm) and m.elementwise_affine:
+                nn.init.constant_(m.bias, 0)
+                nn.init.constant_(m.weight, 1.0)
+        self.apply(_init_transformers_weights)
+
+        # then special case
+        for n, m in self.named_modules():
+            if hasattr(m, 'init_layer'):
+                type_ = str(type(m))
+                m.init_layer()
+
+    def no_weight_decay(self):
+        return ['token_roi']
+
+    @torch.no_grad()
+    def init_layer(self):
+        nn.init.trunc_normal_(self.token_embedding.weight, std=1.)
+
+        self.token_roi.weight[..., :2].data.fill_(0.0)
+        self.token_roi.weight[..., 2:].data.fill_(1.0)
+
+        def init_grid(root, offset, unit_width=0.5):
+            grid = torch.arange(root).float()/(root-1)
+            grid = grid.view(root, -1)
+            grid_x = grid.view(root, 1, 1).repeat(1, root, 1)
+            grid_y = grid.view(1, root, 1).repeat(root, 1, 1)
+            grid = torch.cat([grid_x, grid_y], dim=-1)
+            token_roi = self.token_roi.weight[offset:offset+root**2].view(
+                root, root, -1)
+            token_roi.data[..., 0:2] = grid * (1-unit_width) + 0.00
+            token_roi.data[..., 2:4] = grid * (1-unit_width) + unit_width
+
+        size = int(self.num_latent_tokens**0.5)
+        init_grid(size, 0, 0.5)
+
+    def forward(self, x: torch.Tensor, return_embedding_and_roi: bool=False):
+        img_feat = self.feat_extractor(x)
+
+        batch_size = img_feat.size(0)
+
+        token_embedding = self.token_embedding.weight\
+            .unsqueeze(1).repeat(1, batch_size, 1)
+        token_roi = self.token_roi.weight\
+            .unsqueeze(1).repeat(1, batch_size, 1)
+
+        for layer in self.layers:
+            if isinstance(layer, SFUnit):
+                token_embedding, token_roi = layer(
+                    img_feat, token_embedding, token_roi)
+            else:
+                token_embedding = layer(token_embedding)
+        if return_embedding_and_roi:
+            return self.head.norm(token_embedding), token_roi
+        else:
+            return self.head(token_embedding)
+
+
+if __name__ == '__main__':
+    net = SparseFormer()
+
+    net.eval()
+
+    IMG_SIZE = 224
+    input = torch.randn(1, 3, IMG_SIZE, IMG_SIZE)
+
+    from fvcore.nn import FlopCountAnalysis, flop_count_table
+    flops = FlopCountAnalysis(net, input)
+    print(flop_count_table(flops, max_depth=2))

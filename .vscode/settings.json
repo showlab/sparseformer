@@ -1,0 +1,10 @@
+{
+    "workbench.colorTheme": "Better Solarized Light",
+    "python.languageServer": "Pylance",
+    "search.exclude": {
+        ".git": true,
+        "output": true,
+        "data": true
+    },
+    "editor.fontFamily": "'SF Mono'"
+}
