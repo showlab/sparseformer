@@ -12,7 +12,7 @@
 ## Codebase
 - For SparseFormer for images, please check [imagenet](./imagenet/).
 
-## Acknowledgement
+## Credits
 The image SparseFormer codebase is heavily based on [Swin codebase](https://github.com/microsoft/Swin-Transformer). A big thank for their great work.
 
 ## Citation

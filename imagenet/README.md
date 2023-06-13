@@ -12,6 +12,9 @@ It is in [models/sparseformer.py](./models/sparseformer.py).
 ### Training
 You can start training our SparseFormer on ImageNet-1K with make targets in [Makefile](./Makefile) when the environment is installed (see the following).
 
+### Caveats
+Till now, we have not yet support mixed precision training of SparseFormer models but it is a planned feature. 
+
 ### Install
 (based on the original Swin [getting_started.md](https://github.com/microsoft/Swin-Transformer/blob/main/get_started.md))
 
