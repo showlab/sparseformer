@@ -54,12 +54,21 @@ def drop_path(x, drop_prob: float = 0., training: bool = False):
     See discussion: https://github.com/tensorflow/tpu/issues/494#issuecomment-532968956 ... I've opted for
     changing the layer and argument names to 'drop path' rather than mix DropConnect as a layer name and use
     'survival rate' as the argument.
+
+    ** IMPORTANT **
+    Modified (Jun. 16, by Ziteng Gao):
+    since we use the second dimension as the batch dimension, the random tensor shape is
+    actually `(1, x.shape[1],) + (1,) * (x.ndim - 2)` (not the originally `(x.shape[0],)
+    +(1,) * (x.ndim - 2)` in timm).
+    Sorry for this bug since I simply adopted timm code in the code reorganization
+    without further investigation.
+    ** This corrected version aligns with the paper **
     """
     if drop_prob == 0. or not training:
         return x
     keep_prob = 1 - drop_prob
     # work with diff dim tensors, not just 2D ConvNets
-    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    shape = (1, x.shape[1],) + (1,) * (x.ndim - 2)
     random_tensor = keep_prob + \
         torch.rand(shape, dtype=x.dtype, device=x.device)
     random_tensor.floor_()  # binarize
