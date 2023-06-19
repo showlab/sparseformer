@@ -7,10 +7,23 @@
 
 from functools import partial
 import torch
+from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import autocast
+from torch.nn.modules.normalization import _shape_t
+
 
 LAYER_NORM = partial(nn.LayerNorm, eps=1e-6)
+GRAD_SCALE = 1.  # global variable tracking grad scale for amp training
+
+
+def _maybe_promote(x: torch.Tensor) -> torch.Tensor:
+    """
+    Credits to Meta's xformers (xformers/components/attention/favor.py)
+    """
+    # Only promote fp16 buffers, bfloat16 would be fine for instance
+    return x.float() if x.dtype == torch.float16 else x
 
 
 @torch.no_grad()
@@ -38,7 +51,8 @@ class RestrictGradNorm(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        norm = ctx.norm
+        # amp training scales up the grad scale for the entire network
+        norm = ctx.norm * GRAD_SCALE
         grad_x = grad_output.clone().clamp(-norm, norm)
         return grad_x, None
 
@@ -92,6 +106,7 @@ class DropPath(nn.Module):
         return drop_path(x, self.drop_prob, self.training)
 
 
+@autocast(enabled=False)
 def roi_adjust(token_roi: torch.Tensor, token_adjust: torch.Tensor):
     token_xy = (token_roi[..., 2:]+token_roi[..., :2]) * 0.5
     token_wh = (token_roi[..., 2:]-token_roi[..., :2]).abs()
@@ -104,29 +119,30 @@ def roi_adjust(token_roi: torch.Tensor, token_adjust: torch.Tensor):
     return token_roi_new
 
 
-def map_to_absolute_coordinates(
+@autocast(enabled=False)
+def translate_to_absolute_coordinates(
         token_roi: torch.Tensor,
-        offset: torch.Tensor,
+        relative_offset_xy: torch.Tensor,
         num_heads: int,
-        num_points: int):
-    batch, num_tokens, _ = offset.shape
+        num_points: int) -> torch.Tensor:
+    batch, num_tokens, _ = relative_offset_xy.shape
 
-    offset = offset.view(batch, num_tokens, 1, num_heads*num_points, 2)
+    relative_offset_xy = relative_offset_xy.view(batch, num_tokens, 1, num_heads*num_points, 2)
 
-    offset_mean = offset.mean(-2, keepdim=True)
-    offset_std = offset.std(-2, keepdim=True)+1e-7
-    offset = (offset - offset_mean)/(3*offset_std)
+    offset_mean = relative_offset_xy.mean(-2, keepdim=True)
+    offset_std = relative_offset_xy.std(-2, keepdim=True)+1e-7
+    relative_offset_xy = (relative_offset_xy - offset_mean)/(3*offset_std)
 
-    offset = offset.view(batch, num_tokens, 1, num_heads*num_points, 2)
+    relative_offset_xy = relative_offset_xy.view(batch, num_tokens, 1, num_heads*num_points, 2)
 
     token_xy = (token_roi[:, :, 2:]+token_roi[:, :, :2])/2.0
     roi_wh = token_roi[:, :, 2:]-token_roi[:, :, :2]
-    offset_xy = offset[..., :2] * \
+    relative_offset_xy = relative_offset_xy[..., :2] * \
         roi_wh.view(batch, num_tokens, 1, 1, 2)
-    sample_yx = token_xy.view(batch, num_tokens, 1, 1, 2) \
-        + offset_xy
+    absolute_xy = token_xy.view(batch, num_tokens, 1, 1, 2) \
+        + relative_offset_xy
 
-    return sample_yx
+    return absolute_xy
 
 
 def conv3x3(in_planes, out_planes, stride=1, dilation=1):
@@ -140,6 +156,7 @@ def conv1x1(in_planes, out_planes, stride=1):
     return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
 
 
+@autocast(enabled=False)
 def feat_sampling_2d(
         sample_points: torch.Tensor,
         value: torch.Tensor,
@@ -151,6 +168,9 @@ def feat_sampling_2d(
 
     sample_points = sample_points.view(batch, Hq, Wq, n_heads, n_points, 2) \
         .permute(0, 3, 1, 2, 4, 5).contiguous().flatten(0, 1)
+    # We truncate the grad for sampling coordinates to the unit length (e.g., 1.0/height)
+    # to avoid inaccurate gradients due to bilinear sampling. In other words, we restrict
+    # gradients to be local.
     sample_points = RestrictGradNorm.apply(sample_points, 1.0/height)
     sample_points = sample_points.flatten(2, 3)
     sample_points = sample_points*2.0-1.0
@@ -165,11 +185,12 @@ def feat_sampling_2d(
     return out.permute(0, 3, 4, 1, 5, 2).flatten(1, 2)
 
 
+@autocast(enabled=False)
 def layer_norm_by_dim(x: torch.Tensor, dim=-1):
     mean = x.mean(dim, keepdim=True)
     x = x - mean
     std = (x.var(dim=dim, keepdim=True)+1e-7).sqrt()
-    return x/std
+    return x / std
 
 
 class AdaptiveMixing(nn.Module):
@@ -192,20 +213,21 @@ class AdaptiveMixing(nn.Module):
         self.eff_in_dim = in_dim//n_groups
         self.eff_out_dim = self.eff_in_dim
 
-        self.m_parameters = (self.eff_in_dim * self.eff_out_dim)
-        self.s_parameters = (self.in_points * self.out_points)
+        self.channel_param_count = (self.eff_in_dim * self.eff_out_dim)
+        self.spatial_param_count = (self.in_points * self.out_points)
 
-        self.total_parameters = self.m_parameters + self.s_parameters
+        self.total_param_count = self.channel_param_count + self.spatial_param_count
 
         self.parameter_generator = nn.Sequential(
             LAYER_NORM(self.query_dim),
             nn.Linear(self.query_dim, self.query_dim//4),
-            nn.Linear(self.query_dim//4, self.total_parameters*self.n_groups),
+            nn.Linear(self.query_dim//4, self.total_param_count*self.n_groups),
         )
 
         self.m_beta = nn.Parameter(torch.zeros(self.eff_out_dim))
         self.s_beta = nn.Parameter(torch.zeros(self.out_points))
 
+        # the name should be `out_proj` but ...
         self.tuo_proj = nn.Linear(n_groups*self.eff_out_dim*self.out_points,
                                   self.out_query_dim)
 
@@ -231,31 +253,30 @@ class AdaptiveMixing(nn.Module):
         assert g == 1
         # batch, num_query, group, point, channel
         G = self.n_groups
-        tuo = x.reshape(B*N*self.n_groups, P, C)
+        out = x.reshape(B*N*self.n_groups, P, C)
 
         params: torch.Tensor = self.parameter_generator(query)
         params = params.reshape(B*N*G, -1)
 
-        M, S = params.split_with_sizes(
+        channel_mixing, spatial_mixing = params.split_with_sizes(
             [self.eff_in_dim*self.eff_out_dim, self.out_points*self.in_points],
             dim=-1
         )
+        channel_mixing = channel_mixing.reshape(B*N*G, self.eff_in_dim, self.eff_out_dim)
+        spatial_mixing = spatial_mixing.reshape(B*N*G, self.out_points, self.in_points)
 
-        M = M.reshape(B*N*G, self.eff_in_dim, self.eff_out_dim)
-        S = S.reshape(B*N*G, self.out_points, self.in_points)
-        m_beta = self.m_beta.view(1, 1, self.eff_out_dim)
-        s_beta = self.s_beta.view(1, self.out_points, 1)
+        channel_bias = self.m_beta.view(1, 1, self.eff_out_dim)
+        spatial_bias = self.s_beta.view(1, self.out_points, 1)
 
-        tuo = torch.baddbmm(m_beta, tuo, M)
-        tuo = self.act(tuo)
+        out = torch.baddbmm(channel_bias, out, channel_mixing)
+        out = self.act(out)
 
-        tuo = torch.baddbmm(s_beta, S, tuo)
-        tuo = self.act(tuo)
+        out = torch.baddbmm(spatial_bias, spatial_mixing, out)
+        out = self.act(out)
+        out = out.reshape(B, N, -1)
+        out = self.tuo_proj(out)
 
-        tuo = tuo.reshape(B, N, -1)
-        tuo = self.tuo_proj(tuo)
-
-        return tuo
+        return out
 
 
 class SFUnit(nn.Module):
@@ -348,8 +369,7 @@ class SFUnit(nn.Module):
         token_roi = roi_adjust(token_roi, roi_adjust_logit)
         return token_roi
 
-    def sampling_mixing(self, feat,
-                        token_embedding: torch.Tensor, token_roi: torch.Tensor):
+    def sampling_mixing(self, feat, token_embedding: torch.Tensor, token_roi: torch.Tensor):
         roi_offset_a = self.roi_offset_module(
             token_embedding
         )
@@ -357,7 +377,7 @@ class SFUnit(nn.Module):
             token_embedding.size(0), token_embedding.size(1), 1)
         roi_offset = roi_offset_base + roi_offset_a
 
-        sampling_points = map_to_absolute_coordinates(
+        sampling_points = translate_to_absolute_coordinates(
             token_roi.transpose(0, 1),
             roi_offset.transpose(0, 1),
             1,
@@ -571,8 +591,12 @@ class SparseFormer(nn.Module):
         size = int(self.num_latent_tokens**0.5)
         init_grid(size, 0, 0.5)
 
-    def forward(self, x: torch.Tensor, return_embedding_and_roi: bool=False):
+    def forward(self, x: torch.Tensor, return_embedding_and_roi: bool = False, scale=1.):
+        # TODO: make GRAD_SCALE not global
+        global GRAD_SCALE
+        GRAD_SCALE = scale
         img_feat = self.feat_extractor(x)
+        img_feat = _maybe_promote(img_feat)
 
         batch_size = img_feat.size(0)
 
@@ -580,6 +604,9 @@ class SparseFormer(nn.Module):
             .unsqueeze(1).repeat(1, batch_size, 1)
         token_roi = self.token_roi.weight\
             .unsqueeze(1).repeat(1, batch_size, 1)
+
+        token_embedding = _maybe_promote(token_embedding)
+        token_roi = _maybe_promote(token_roi)
 
         for layer in self.layers:
             if isinstance(layer, SFUnit):

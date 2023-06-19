@@ -29,6 +29,7 @@ from lr_scheduler import build_scheduler
 from optimizer import build_optimizer
 from logger import create_logger
 from utils import load_checkpoint, load_pretrained, save_checkpoint, get_grad_norm, auto_resume_helper, reduce_tensor
+from torch.cuda.amp import autocast, GradScaler
 
 try:
     # noinspection PyUnresolvedReferences
@@ -66,7 +67,7 @@ def parse_option():
                         help="gradient accumulation steps")
     parser.add_argument('--use-checkpoint', action='store_true',
                         help="whether to use gradient checkpointing to save memory")
-    parser.add_argument('--amp-opt-level', type=str, default='O1', choices=['O0', 'O1', 'O2'],
+    parser.add_argument('--amp-opt-level', type=str, default='O0', choices=['O0', 'A'],
                         help='mixed precision opt level, if O0, no amp is used')
     parser.add_argument('--output', default='output', type=str, metavar='PATH',
                         help='root of output folder, the full path is <output>/<model_name>/<tag> (default: output)')
@@ -88,14 +89,11 @@ def parse_option():
 
 
 def main(config):
-    if config.AMP_OPT_LEVEL != "O0":
+    if not config.AMP_OPT_LEVEL in ["A", "O0"]:
         raise NotImplementedError(
             """
-            SparseFormer does not currently support AMP training.
-            If you still want to proceed, please comment out this error.
-            However, please note that you may encounter numerical errors
-            and unexpected performance issues.
-            This is mainly due to the RoI adjusting mechanism.
+            Please specify AMP_OPT_LEVEL=A to enable automatic mixed precision training,
+            or AMP_OPT_LEVEL=O0 to make the training fully in FP32.
             """
         )
     dataset_train, dataset_val, data_loader_train, data_loader_val, mixup_fn = build_loader(
@@ -114,11 +112,7 @@ def main(config):
         )
         logger.info("Using EMA with decay = %.8f" % config.EMA.DECAY)
 
-
     optimizer = build_optimizer(config, model)
-    if config.AMP_OPT_LEVEL != "O0":
-        model, optimizer = amp.initialize(
-            model, optimizer, opt_level=config.AMP_OPT_LEVEL)
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[
                                                       config.LOCAL_RANK], broadcast_buffers=False, find_unused_parameters=False)
     model_without_ddp = model.module
@@ -183,11 +177,16 @@ def main(config):
 
     logger.info("Start training")
     start_time = time.time()
+    
+    scaler = GradScaler(init_scale=2 ** 16)
+
     for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
         data_loader_train.sampler.set_epoch(epoch)
 
         train_one_epoch(config, model, criterion, data_loader_train,
-                        optimizer, epoch, mixup_fn, lr_scheduler, model_ema=model_ema)
+                        optimizer, epoch, mixup_fn, lr_scheduler,
+                        model_ema=model_ema,
+                        scaler=scaler)
         if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
             save_checkpoint(config, epoch, model_without_ddp, max_accuracy,
                             optimizer, lr_scheduler, logger, model_ema=model_ema)
@@ -214,7 +213,7 @@ def main(config):
     logger.info('Training time {}'.format(total_time_str))
 
 
-def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, model_ema=None):
+def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, model_ema=None, scaler: GradScaler=None):
     model.train()
     optimizer.zero_grad()
 
@@ -225,6 +224,9 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
 
     start = time.time()
     end = time.time()
+
+    last_scale = scaler.get_scale()
+
     for idx, (samples, targets) in enumerate(data_loader):
         samples = samples.cuda(non_blocking=True)
         targets = targets.cuda(non_blocking=True)
@@ -232,19 +234,13 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
 
-        outputs = model(samples)
-
         if config.TRAIN.ACCUMULATION_STEPS > 1:
+            assert False
             loss = criterion(outputs, targets)
             loss = loss / config.TRAIN.ACCUMULATION_STEPS
-            if config.AMP_OPT_LEVEL != "O0":
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-                if config.TRAIN.CLIP_GRAD:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        amp.master_params(optimizer), config.TRAIN.CLIP_GRAD)
-                else:
-                    grad_norm = get_grad_norm(amp.master_params(optimizer))
+            if config.AMP_OPT_LEVEL == "A":
+
+                pass
             else:
                 loss.backward()
                 if config.TRAIN.CLIP_GRAD:
@@ -257,25 +253,35 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
                 optimizer.zero_grad()
                 lr_scheduler.step_update(epoch * num_steps + idx)
         else:
-            loss = criterion(outputs, targets)
             optimizer.zero_grad()
-            if config.AMP_OPT_LEVEL != "O0":
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
+            if config.AMP_OPT_LEVEL == "A":
+                with autocast(enabled=True):
+                    outputs = model(samples, scale=scaler.get_scale())
+                    loss = criterion(outputs, targets)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
                 if config.TRAIN.CLIP_GRAD:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
-                        amp.master_params(optimizer), config.TRAIN.CLIP_GRAD)
-                else:
-                    grad_norm = get_grad_norm(amp.master_params(optimizer))
+                        model.parameters(), config.TRAIN.CLIP_GRAD)
+                scaler.step(optimizer)
+                scaler.update()
+                lr_scheduler.step_update(epoch * num_steps + idx)
+
+                scale = scaler.get_scale()
+                if scale != last_scale:
+                    logger.warning(f"[WARNING] scale changes from {last_scale:.5f} to {scale:.5f}")
+                    last_scale = scale
             else:
+                outputs = model(samples)
+                loss = criterion(outputs, targets)
                 loss.backward()
                 if config.TRAIN.CLIP_GRAD:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         model.parameters(), config.TRAIN.CLIP_GRAD)
                 else:
                     grad_norm = get_grad_norm(model.parameters())
-            optimizer.step()
-            lr_scheduler.step_update(epoch * num_steps + idx)
+                optimizer.step()
+                lr_scheduler.step_update(epoch * num_steps + idx)
             if model_ema is not None:
                 model_ema.update(model)
 
@@ -375,9 +381,6 @@ def throughput(data_loader, model, logger):
 
 if __name__ == '__main__':
     _, config = parse_option()
-
-    if config.AMP_OPT_LEVEL != "O0":
-        assert amp is not None, "amp not installed!"
 
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ["RANK"])

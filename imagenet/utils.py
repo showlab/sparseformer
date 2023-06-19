@@ -41,7 +41,8 @@ def load_checkpoint(config, model, optimizer, lr_scheduler, logger):
         config.TRAIN.START_EPOCH = checkpoint['epoch'] + 1
         config.freeze()
         if 'amp' in checkpoint and config.AMP_OPT_LEVEL != "O0" and checkpoint['config'].AMP_OPT_LEVEL != "O0":
-            amp.load_state_dict(checkpoint['amp'])
+            # amp.load_state_dict(checkpoint['amp'])
+            pass
         logger.info(
             f"=> loaded successfully '{config.MODEL.RESUME}' (epoch {checkpoint['epoch']})")
         if 'max_accuracy' in checkpoint:
