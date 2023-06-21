@@ -18,6 +18,7 @@ try:
 except ImportError:
     amp = None
 
+
 def load_checkpoint(config, model, optimizer, lr_scheduler, logger):
     logger.info(
         f"==============> Resuming form {config.MODEL.RESUME}....................")
@@ -74,7 +75,8 @@ def load_pretrained(config, model, logger):
         del state_dict[k]
 
     # bicubic interpolate relative_position_bias_table if not match
-    relative_position_bias_table_keys = [k for k in state_dict.keys() if "relative_position_bias_table" in k]
+    relative_position_bias_table_keys = [
+        k for k in state_dict.keys() if "relative_position_bias_table" in k]
     for k in relative_position_bias_table_keys:
         relative_position_bias_table_pretrained = state_dict[k]
         relative_position_bias_table_current = model.state_dict()[k]
@@ -90,7 +92,8 @@ def load_pretrained(config, model, logger):
                 relative_position_bias_table_pretrained_resized = torch.nn.functional.interpolate(
                     relative_position_bias_table_pretrained.permute(1, 0).view(1, nH1, S1, S1), size=(S2, S2),
                     mode='bicubic')
-                state_dict[k] = relative_position_bias_table_pretrained_resized.view(nH2, L2).permute(1, 0)
+                state_dict[k] = relative_position_bias_table_pretrained_resized.view(
+                    nH2, L2).permute(1, 0)
 
     # bicubic interpolate absolute_pos_embed if not match
     absolute_pos_embed_keys = [k for k in state_dict.keys() if "absolute_pos_embed" in k]
@@ -106,12 +109,15 @@ def load_pretrained(config, model, logger):
             if L1 != L2:
                 S1 = int(L1 ** 0.5)
                 S2 = int(L2 ** 0.5)
-                absolute_pos_embed_pretrained = absolute_pos_embed_pretrained.reshape(-1, S1, S1, C1)
+                absolute_pos_embed_pretrained = absolute_pos_embed_pretrained.reshape(
+                    -1, S1, S1, C1)
                 absolute_pos_embed_pretrained = absolute_pos_embed_pretrained.permute(0, 3, 1, 2)
                 absolute_pos_embed_pretrained_resized = torch.nn.functional.interpolate(
                     absolute_pos_embed_pretrained, size=(S2, S2), mode='bicubic')
-                absolute_pos_embed_pretrained_resized = absolute_pos_embed_pretrained_resized.permute(0, 2, 3, 1)
-                absolute_pos_embed_pretrained_resized = absolute_pos_embed_pretrained_resized.flatten(1, 2)
+                absolute_pos_embed_pretrained_resized = absolute_pos_embed_pretrained_resized.permute(
+                    0, 2, 3, 1)
+                absolute_pos_embed_pretrained_resized = absolute_pos_embed_pretrained_resized.flatten(
+                    1, 2)
                 state_dict[k] = absolute_pos_embed_pretrained_resized
 
     if "head.head.bias" in state_dict.keys():
@@ -143,8 +149,11 @@ def load_pretrained(config, model, logger):
     torch.cuda.empty_cache()
 
 
-def save_checkpoint(config, epoch, model, max_accuracy, optimizer, lr_scheduler, logger, model_ema=None):
+def save_checkpoint(config, epoch, model, max_accuracy, optimizer, lr_scheduler, logger,
+                    model_ema=None,
+                    model_ema_best_dict=None):
     save_state = {'model': model.state_dict(),
+                  'model_best': model_ema_best_dict if model_ema_best_dict else None,
                   'model_ema': model_ema.module.state_dict() if model_ema else None,
                   'optimizer': optimizer.state_dict(),
                   'lr_scheduler': lr_scheduler.state_dict(),
@@ -178,7 +187,8 @@ def auto_resume_helper(output_dir):
     checkpoints = [ckpt for ckpt in checkpoints if ckpt.endswith('pth')]
     print(f"All checkpoints founded in {output_dir}: {checkpoints}")
     if len(checkpoints) > 0:
-        latest_checkpoint = max([os.path.join(output_dir, d) for d in checkpoints], key=os.path.getmtime)
+        latest_checkpoint = max([os.path.join(output_dir, d)
+                                for d in checkpoints], key=os.path.getmtime)
         print(f"The latest checkpoint founded: {latest_checkpoint}")
         resume_file = latest_checkpoint
     else:
@@ -191,5 +201,3 @@ def reduce_tensor(tensor):
     dist.all_reduce(rt, op=dist.ReduceOp.SUM)
     rt /= dist.get_world_size()
     return rt
-
-

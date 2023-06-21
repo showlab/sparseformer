@@ -177,8 +177,10 @@ def main(config):
 
     logger.info("Start training")
     start_time = time.time()
-    
+
     scaler = GradScaler(init_scale=2 ** 16)
+
+    model_ema_best_dict = model_ema.state_dict()
 
     for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
         data_loader_train.sampler.set_epoch(epoch)
@@ -187,14 +189,14 @@ def main(config):
                         optimizer, epoch, mixup_fn, lr_scheduler,
                         model_ema=model_ema,
                         scaler=scaler)
-        if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
-            save_checkpoint(config, epoch, model_without_ddp, max_accuracy,
-                            optimizer, lr_scheduler, logger, model_ema=model_ema)
 
         if config.EMA.ENABLE:
             model_to_valid = model_ema.module
             acc1, acc5, loss = validate(
                 config, data_loader_val, model_to_valid, epoch=epoch)
+            is_better = acc1 > max_accuracy
+            if is_better:
+                model_ema_best_dict = model_ema.state_dict()
             logger.info(
                 f"[EMA] Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
             max_accuracy = max(max_accuracy, acc1)
@@ -205,15 +207,22 @@ def main(config):
             config, data_loader_val, model_to_valid, epoch=epoch)
         logger.info(
             f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
+
+
         max_accuracy = max(max_accuracy, acc1)
         logger.info(f'Max accuracy: {max_accuracy:.2f}%')
+        if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
+            save_checkpoint(config, epoch, model_without_ddp, max_accuracy,
+                            optimizer, lr_scheduler, logger,
+                            model_ema=model_ema,
+                            model_ema_best_dict=model_ema_best_dict)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     logger.info('Training time {}'.format(total_time_str))
 
 
-def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, model_ema=None, scaler: GradScaler=None):
+def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, model_ema=None, scaler: GradScaler = None):
     model.train()
     optimizer.zero_grad()
 

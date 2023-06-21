@@ -15,7 +15,6 @@ from torch.nn.modules.normalization import _shape_t
 
 
 LAYER_NORM = partial(nn.LayerNorm, eps=1e-6)
-GRAD_SCALE = 1.  # global variable tracking grad scale for amp training
 
 
 def _maybe_promote(x: torch.Tensor) -> torch.Tensor:
@@ -43,6 +42,7 @@ def init_linear_params(weight, bias):
 
 
 class RestrictGradNorm(torch.autograd.Function):
+    GRAD_SCALE = 1.0 # variable tracking grad scale
     @staticmethod
     def forward(ctx, x, norm=0.1):
         ctx.norm = norm
@@ -52,7 +52,7 @@ class RestrictGradNorm(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         # amp training scales up the grad scale for the entire network
-        norm = ctx.norm * GRAD_SCALE
+        norm = ctx.norm * RestrictGradNorm.GRAD_SCALE
         grad_x = grad_output.clone().clamp(-norm, norm)
         return grad_x, None
 
@@ -592,9 +592,7 @@ class SparseFormer(nn.Module):
         init_grid(size, 0, 0.5)
 
     def forward(self, x: torch.Tensor, return_embedding_and_roi: bool = False, scale=1.):
-        # TODO: make GRAD_SCALE not global
-        global GRAD_SCALE
-        GRAD_SCALE = scale
+        RestrictGradNorm.GRAD_SCALE = scale
         img_feat = self.feat_extractor(x)
         img_feat = _maybe_promote(img_feat)
 

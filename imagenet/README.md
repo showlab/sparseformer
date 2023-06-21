@@ -3,9 +3,9 @@
 ## Result
 | config                                    | ImageNet top-1 | GFLOPs | Params | ckpt   | log |
 |-------------------------------------------|----------------|--------|--------|--------|-----|
-| [SF-Tiny](./configs/sparseformer_t.yaml)  | 81.0           | 2.0G   | 32M    | (soon) |     |
-| [SF-Small](./configs/sparseformer_s.yaml) | 82.0           | 3.8G   | 48M    | (soon) |     |
-| [SF-Base](./configs/sparseformer_b.yaml)  | 82.6           | 7.8G   | 81M    | (soon) |     |
+| [SF-Tiny](./configs/sparseformer_t.yaml)  | 81.0           | 2.0G   | 32M    | [(google drive)](https://drive.google.com/file/d/1ldsK-8ZaJ0vz1uzGzXAmJGnAwvTe0Kcl/view?usp=drive_link) | [(google drive)](https://drive.google.com/file/d/1ldsK-8ZaJ0vz1uzGzXAmJGnAwvTe0Kcl/view?usp=drive_link) |
+| [SF-Small](./configs/sparseformer_s.yaml) | 82.0           | 3.8G   | 48M    | [(google drive)](https://drive.google.com/file/d/1YqzEeMWdg9VQUunj_d6M0NWlTqfdxRC2/view?usp=drive_link) | [(google drive)](https://drive.google.com/file/d/1YqzEeMWdg9VQUunj_d6M0NWlTqfdxRC2/view?usp=drive_link) |
+| [SF-Base](./configs/sparseformer_b.yaml)  | 82.6           | 7.8G   | 81M    | [(google drive)](https://drive.google.com/file/d/1Ko_lBXnX_fWDh5b9lkwEEvYIt11Q5pOD/view?usp=drive_link) | [(google drive)](https://drive.google.com/file/d/1Ko_lBXnX_fWDh5b9lkwEEvYIt11Q5pOD/view?usp=drive_link) |
 ## Main model file
 It is in [models/sparseformer.py](./models/sparseformer.py).
 ## Usage
