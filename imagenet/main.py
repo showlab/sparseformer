@@ -180,7 +180,7 @@ def main(config):
 
     scaler = GradScaler(init_scale=2 ** 16)
 
-    model_ema_best_dict = model_ema.state_dict()
+    model_ema_best_dict = model_ema.state_dict() if model_ema is not None else None
 
     for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
         data_loader_train.sampler.set_epoch(epoch)
