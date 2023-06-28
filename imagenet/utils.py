@@ -161,7 +161,8 @@ def save_checkpoint(config, epoch, model, max_accuracy, optimizer, lr_scheduler,
                   'epoch': epoch,
                   'config': config}
     if config.AMP_OPT_LEVEL != "O0":
-        save_state['amp'] = amp.state_dict()
+        # save_state['amp'] = amp.state_dict()
+        pass
 
     save_path = os.path.join(config.OUTPUT, f'ckpt_epoch_{epoch}.pth')
     logger.info(f"{save_path} saving......")
