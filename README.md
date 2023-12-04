@@ -4,11 +4,6 @@
 
 [[arxiv]](https://arxiv.org/abs/2304.03768)
 
-## ⏰ Timeline
-- [x] Release the image SparseFormer code (Jun. 13)
-- [x] Release the ImageNet pretrained model (Jun. 21)
-- [ ] Release the video SparseFormer code
-
 ## Codebase
 - For SparseFormer for images, please check [imagenet](./imagenet/).
 
