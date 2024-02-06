@@ -5,14 +5,17 @@
 # Written by Ziteng Gao
 # --------------------------------------------------------
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from functools import partial
+from enum import Enum
+
 from torch import Tensor
 from torch.cuda.amp import autocast
-from .utils import _maybe_promote, init_layer_norm_unit_norm, init_linear_params, RestrictGradNorm, DropPath, SFAttrDict
+from .utils import _maybe_promote, init_layer_norm_unit_norm, init_linear_params, RestrictGradNorm, DropPath, CompatibleAttrDict
 
 
 from timm.layers.mlp import Mlp
@@ -20,10 +23,18 @@ from timm.models.vision_transformer import Attention
 
 LAYER_NORM = partial(nn.LayerNorm, eps=1e-6)
 
-OP_ATTN = "op_attn"
-OP_MLP = "op_mlp"
-OP_SAM = "op_sam"
-OP_ADJ = "op_adj"
+class OP(Enum):
+    ATTN = 1
+    MLP = 2
+    SAM = 3
+    ADJ = 4
+    PE_INJ = 5
+
+DEFAULT_OPS_LIST = \
+[[OP.ATTN, OP.ADJ, OP.SAM, OP.MLP]] + \
+[[OP.ATTN, OP.ADJ, OP.SAM, OP.MLP]] + \
+[[OP.ATTN, OP.MLP]] * 7
+
 
 @autocast(enabled=False)
 def roi_adjust(token_roi: Tensor, token_adjust: Tensor):
@@ -74,11 +85,13 @@ def sampling_from_img_feat(
 
     sampling_point = sampling_point.view(batch, Hq, Wq, n_heads, n_points, 2) \
         .permute(0, 3, 1, 2, 4, 5).contiguous().flatten(0, 1)
+
     if restrict_grad_norm:
         # We truncate the grad for sampling coordinates to the unit length (e.g., 1.0/height)
         # to avoid inaccurate gradients due to bilinear sampling. That is, we restrict
         # gradients to be local.
         sampling_point = RestrictGradNorm.apply(sampling_point, 1.0/height)
+
     sampling_point = sampling_point.flatten(2, 3)
     sampling_point = sampling_point*2.0-1.0
     img_feat = img_feat.view(batch*n_heads, channel//n_heads, height, width)
@@ -91,6 +104,24 @@ def sampling_from_img_feat(
 
     return out.permute(0, 3, 4, 1, 5, 2).flatten(1, 2)
 
+@torch.no_grad()
+def position_encoding(roi: Tensor, embed: Tensor, max_temperature=128):
+    assert roi.size(-1) == 4
+    num_feats = embed.size(-1) // 4
+    roi = roi * math.pi
+    dim_t = torch.linspace(
+        0, math.log(max_temperature), num_feats, dtype=roi.dtype, device=roi.device
+    )
+    dim_t = dim_t.exp().view(1, 1, 1, -1)
+    pos_x = roi[..., None] * dim_t
+    pos_x = torch.cat(
+        (
+            pos_x[..., 0::2].sin() ,
+            pos_x[..., 1::2].cos() ,
+        ),
+        dim=3,
+    ).flatten(2)
+    return pos_x
 
 @autocast(enabled=False)
 def layer_norm_by_dim(x: Tensor, dim: int=-1):
@@ -109,11 +140,13 @@ class AdaptiveMixing(nn.Module):
             out_points: int=None,
             out_query_dim: int=None,
             mixing_bias: bool = True,
+            pg_inner_dim = .25,
             norm_layer = nn.LayerNorm
         ):
         super(AdaptiveMixing, self).__init__()
         out_dim = out_dim if out_dim is not None else in_dim
         out_points = out_points if out_points is not None else in_points
+        out_points = max(out_points, 32)
         query_dim = query_dim if query_dim is not None else in_dim
         out_query_dim = out_query_dim if out_query_dim is not None else query_dim
 
@@ -134,10 +167,15 @@ class AdaptiveMixing(nn.Module):
 
         self.total_param_count = self.channel_param_count + self.spatial_param_count
 
+        if isinstance(pg_inner_dim, float):
+            pg_inner_dim = int(pg_inner_dim*query_dim)
+        else:
+            assert isinstance(pg_inner_dim, int)
+
         self.parameter_generator = nn.Sequential(
             norm_layer(self.query_dim),
-            nn.Linear(self.query_dim, self.query_dim//4),
-            nn.Linear(self.query_dim//4, self.total_param_count),
+            nn.Linear(self.query_dim, pg_inner_dim),
+            nn.Linear(pg_inner_dim, self.total_param_count),
         )
 
         if self.mixing_bias:
@@ -181,10 +219,9 @@ class AdaptiveMixing(nn.Module):
         channel_mixing = channel_mixing.reshape(batch*num_tokens, self.eff_in_dim, self.eff_out_dim)
         spatial_mixing = spatial_mixing.reshape(batch*num_tokens, self.out_points, self.in_points)
 
-        channel_bias = self.m_beta.view(1, 1, self.eff_out_dim)
-        spatial_bias = self.s_beta.view(1, self.out_points, 1)
-
         if self.mixing_bias:
+            channel_bias = self.m_beta.view(1, 1, self.eff_out_dim)
+            spatial_bias = self.s_beta.view(1, self.out_points, 1)
             out = torch.baddbmm(channel_bias, out, channel_mixing)
             out = self.act(out)
             out = torch.baddbmm(spatial_bias, spatial_mixing, out)
@@ -200,21 +237,19 @@ class AdaptiveMixing(nn.Module):
         return out
 
 
-        
-
 class SFUnit(nn.Module):
     def __init__(
         self,
         dim,
         img_feat_dim,
-        ops=[OP_ATTN, OP_MLP],
+        ops=[OP.ATTN, OP.MLP],
         num_sampling_points=36,
         num_attn_heads=64,
         mlp_ratio=4,
         repeats=1,
         drop_path=0.0,
         norm_layer=nn.LayerNorm,
-        config: SFAttrDict = None,
+        compatible_config: CompatibleAttrDict = None,
     ):
         super(SFUnit, self).__init__()
 
@@ -223,11 +258,13 @@ class SFUnit(nn.Module):
 
         self.num_sampling_points = num_sampling_points
         self.repeats = repeats
-        self.config = config
+        self.compatible_config = compatible_config
 
-        if OP_SAM in ops:
+        if OP.SAM in ops:
             self.adaptive_mixing = AdaptiveMixing(
-                img_feat_dim, num_sampling_points, query_dim=dim, out_query_dim=dim
+                img_feat_dim, num_sampling_points, query_dim=dim, out_query_dim=dim,
+                pg_inner_dim=compatible_config.pg_inner_dim,
+                mixing_bias=compatible_config.mixing_bias,
             )
             self.roi_offset_module = nn.Sequential(
                 norm_layer(dim),
@@ -242,7 +279,7 @@ class SFUnit(nn.Module):
             self.roi_offset_bias = None
 
 
-        if OP_ATTN in ops:
+        if OP.ATTN in ops:
             self.norm1 = norm_layer(dim)
             self.attn = Attention(
                 dim,
@@ -250,13 +287,13 @@ class SFUnit(nn.Module):
                 qkv_bias=True,
             )
 
-        if OP_MLP in ops:
+        if OP.MLP in ops:
             self.norm2 = norm_layer(dim)
             self.mlp = Mlp(dim, hidden_features=dim*mlp_ratio)
 
 
-        if OP_ADJ in ops:
-            type_op_adjust = config.type_op_adjust if config else 1
+        if OP.ADJ in ops:
+            type_op_adjust = compatible_config.type_op_adjust
             if type_op_adjust == 1:
                 self.roi_adjust_module = nn.Sequential(
                     norm_layer(dim),
@@ -270,6 +307,12 @@ class SFUnit(nn.Module):
                     nn.Linear(dim, 4, bias=False),
                 )
 
+        if OP.PE_INJ in ops:
+            self.pe_transition = nn.Sequential(
+                norm_layer(dim),
+                nn.Linear(dim, dim),
+            )
+
         self.drop_path = drop_path
         self.dropout = DropPath(
             drop_path if isinstance(drop_path, (float, int)) else .0,
@@ -279,17 +322,17 @@ class SFUnit(nn.Module):
     @torch.no_grad()
     def init_layer(self):
         ops = self.ops
-        if OP_ATTN in ops:
+        if OP.ATTN in ops:
             init_linear_params(self.attn.qkv.weight, self.attn.qkv.bias)
 
-        if OP_ADJ in ops:
+        if OP.ADJ in ops:
             init_layer_norm_unit_norm(self.roi_adjust_module[0],  1.)
             nn.init.zeros_(self.roi_adjust_module[-1].weight)
             pass
 
-        if OP_SAM in ops:
+        if OP.SAM in ops:
             init_layer_norm_unit_norm(self.roi_offset_module[0],  1.)
-            nn.init.zeros_(self.roi_adjust_module[-1].weight)
+            nn.init.zeros_(self.roi_offset_module[-1].weight)
 
             root = int(self.num_sampling_points**0.5)
             x = torch.linspace(0.5/root, 1-0.5/root, root)\
@@ -323,7 +366,7 @@ class SFUnit(nn.Module):
             sampling_point,
             img_feat,
             n_points=self.num_sampling_points,
-            restrict_grad_norm=self.config.restrict_grad_norm if self.config else True,
+            restrict_grad_norm=self.compatible_config.restrict_grad_norm if self.compatible_config else True,
         )
 
         src = self.adaptive_mixing(sampled_feat, inp)
@@ -356,14 +399,18 @@ class SFUnit(nn.Module):
             self.dropout.drop_prob = drop_path
 
         for op in self.ops:
-            if op == OP_ATTN:
+            if op == OP.ATTN:
                 embed = self.attn_forward(embed)
-            elif op == OP_MLP:
+            elif op == OP.MLP:
                 embed = self.mlp_forward(embed)
-            elif op == OP_ADJ:
+            elif op == OP.ADJ:
                 roi = self.shift_token_roi(embed, roi)
-            elif op == OP_SAM:
+            elif op == OP.SAM:
                 embed = self.sampling_mixing(img_feat, embed, roi)
+            elif op == OP.PE_INJ:
+                pe = self.pe_transition(position_encoding(roi, embed))
+                embed = embed + pe
+
 
         return embed, roi
 
@@ -386,17 +433,25 @@ class SFUnit(nn.Module):
         return token_embedding, token_roi
 
 
-class AvgTokenHead(nn.Module):
-    def __init__(self, in_dim, dim=0, num_classes=1000, norm_layer = nn.LayerNorm):
-        super(AvgTokenHead, self).__init__()
-        self.dim = dim
+class Head(nn.Module):
+    def __init__(self,
+        in_dim,
+        num_classes=1000,
+        norm_layer=nn.LayerNorm,
+        op="avg",
+    ):
+        super(Head, self).__init__()
         self.in_dim = in_dim
         self.num_classes = num_classes
+        self.op = op
         self.norm = norm_layer(in_dim)
         self.classifier = nn.Linear(in_dim, num_classes)
 
     def forward(self, x):
-        x = x.mean(dim=self.dim)
+        if self.op == "avg":
+            x = x.mean(1)
+        elif self.op == "cls":
+            x = x[:, 0]
         return self.classifier(self.norm(x))
 
 
@@ -422,27 +477,44 @@ class EarlyConvolution(nn.Module):
 
 
 class SparseFormer(nn.Module):
-    def __init__(self,
-                 conv_dim=96,
-                 num_latent_tokens=49,
-                 num_sampling_points=36,
-                 width_configs=[256, 512],
-                 block_sizes=[1, 8],
-                 repeats=[4, 1],
-                 drop_path_rate=0.2,
-                 norm_layer=nn.LayerNorm):
+    def __init__(
+        self,
+        conv_dim=96,
+        num_latent_tokens=49,
+        same_token_embedding=False,
+        cls_token_insert_layer=-1,
+        num_sampling_points=36,
+        width_configs=[256,]+[512,]*8,
+        repeats=[4,]+[1,]*8,
+        drop_path_rate=0.2,
+        ops_list=None,
+        norm_layer=nn.LayerNorm,
+        head_op="avg",
+        compatible_config: CompatibleAttrDict=None,
+    ):
         super(SparseFormer, self).__init__()
         self.num_latent_tokens = num_latent_tokens
         self.width_configurations = width_configs
-        self.block_sizes = block_sizes
         self.repeats = repeats
+
+        compatible_config = CompatibleAttrDict() if compatible_config is None else compatible_config
+        ops_list = DEFAULT_OPS_LIST if ops_list is None else ops_list
 
         self.feat_extractor = EarlyConvolution(conv_dim=conv_dim)
 
         start_dim = width_configs[0]
         end_dim = width_configs[-1]
         self.initial_roi = nn.Embedding(num_latent_tokens, 4)
-        self.initial_embedding = nn.Embedding(num_latent_tokens, start_dim)
+        if same_token_embedding:
+            self.initial_embedding = nn.Embedding(1, start_dim) 
+        else:
+            self.initial_embedding = nn.Embedding(num_latent_tokens, start_dim) 
+        
+        self.cls_token_insert_idx = cls_token_insert_layer
+        if cls_token_insert_layer > 0:
+            self.cls_embedding = nn.Embedding(1, end_dim)
+        else:
+            self.cls_embedding = None
 
         self.layers = nn.ModuleList()
 
@@ -450,44 +522,36 @@ class SparseFormer(nn.Module):
         nums = []
         for i, width in enumerate(width_configs):
             repeat = repeats[i]
-            block_size = block_sizes[i]
-            nums += [block_size * repeat]
+            nums += [repeat]
         lin_drop_path = list(torch.linspace(0.0, drop_path_rate, sum(nums)))
         lin_drop_path = [p.item() for p in lin_drop_path]
 
         block_wise_idx = 0
         for i, width in enumerate(width_configs):
             repeat = repeats[i]
-            block_size = block_sizes[i]
-            nums += [block_size * repeat]
             if i > 0 and width_configs[i-1] != width_configs[i]:
                 transition = nn.Sequential(
                     nn.Linear(width_configs[i-1], width_configs[i]),
-                    norm_layer(width_configs[i])
+                    norm_layer(width_configs[i]) if compatible_config.transition_ln else nn.Identity()
                 )
                 self.layers.append(transition)
 
-            if repeat > 1:
-                assert block_size == 1
+            ops = ops_list[i]
 
-            for block_idx in range(block_size):
-                if block_idx == 0:
-                    ops = [OP_ATTN, OP_ADJ, OP_SAM, OP_MLP]
-                else:
-                    ops = [OP_ATTN, OP_MLP]
-                module = SFUnit(
-                    width,
-                    img_feat_dim=conv_dim,
-                    num_sampling_points=num_sampling_points,
-                    repeats=repeat,
-                    drop_path=lin_drop_path[block_wise_idx:block_wise_idx+repeat],
-                    norm_layer=norm_layer,
-                    ops=ops
-                )
-                self.layers.append(module)
-                block_wise_idx += repeat
-
-        self.head = AvgTokenHead(end_dim, dim=1, norm_layer=norm_layer)
+            module = SFUnit(
+                width,
+                img_feat_dim=conv_dim,
+                num_sampling_points=num_sampling_points,
+                repeats=repeat,
+                drop_path=lin_drop_path[block_wise_idx:block_wise_idx+repeat],
+                norm_layer=norm_layer,
+                ops=ops,
+                compatible_config=compatible_config
+            )
+            self.layers.append(module)
+            block_wise_idx += repeat
+        
+        self.head = Head(end_dim, norm_layer=norm_layer, op=head_op)
 
         self.srnet_init()
 
@@ -508,7 +572,13 @@ class SparseFormer(nn.Module):
                 m.init_layer()
 
     def no_weight_decay(self):
-        return ['token_roi']
+        return ['initial_roi']
+
+    def _batchify(self, x: Tensor, batch_size: int):
+        return x.unsqueeze(0).repeat(batch_size, 1, 1)
+
+    def _expand_if_necessary(self, x: Tensor):
+        return x if x.size(1) == self.num_latent_tokens else x.repeat(1, self.num_latent_tokens, 1)
 
     @torch.no_grad()
     def init_layer(self):
@@ -533,24 +603,30 @@ class SparseFormer(nn.Module):
 
     def forward(self, x: Tensor, return_embedding_and_roi: bool = False, scale=1.):
         RestrictGradNorm.GRAD_SCALE = scale
+        batch_size = x.size(0)
+
         img_feat = self.feat_extractor(x)
         img_feat = _maybe_promote(img_feat)
 
-        batch_size = img_feat.size(0)
-
-        token_embedding = self.initial_embedding.weight\
-            .unsqueeze(0).repeat(batch_size, 1, 1)
-        token_roi = self.initial_roi.weight\
-            .unsqueeze(0).repeat(batch_size, 1, 1)
+        token_embedding = self._batchify(self.initial_embedding.weight, batch_size)
+        token_embedding = self._expand_if_necessary(token_embedding)
+        token_roi = self._batchify(self.initial_roi.weight, batch_size)
+        token_roi = self._expand_if_necessary(token_roi)
 
         token_embedding = _maybe_promote(token_embedding)
         token_roi = _maybe_promote(token_roi)
 
+        layer_idx = 0
         for layer in self.layers:
             if isinstance(layer, SFUnit):
+                if layer_idx == self.cls_token_insert_idx:
+                    cls_embedding = self._batchify(self.cls_embedding.weight, batch_size)
+                    token_embedding = torch.cat([cls_embedding, token_embedding], dim=1)
                 token_embedding, token_roi = layer(img_feat, token_embedding, token_roi)
+                layer_idx += 1
             else:
                 token_embedding = layer(token_embedding)
+
         if return_embedding_and_roi:
             return self.head.norm(token_embedding), token_roi
         else:

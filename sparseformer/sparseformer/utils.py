@@ -12,11 +12,15 @@ class AttrDict(dict):
         self.__dict__ = self
 
 
-class SFAttrDict(AttrDict):
+class CompatibleAttrDict(AttrDict):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.type_op_adjust = 1
         self.restrict_grad_norm = True
+        self.pg_inner_dim = .25
+        self.transition_ln = True
+        self.mixing_bias = True
+        self.update(**kwargs)
 
 def _maybe_promote(x: Tensor) -> Tensor:
     """
@@ -25,25 +29,6 @@ def _maybe_promote(x: Tensor) -> Tensor:
     # Only promote fp16 buffers, bfloat16 would be fine for instance
     return x.float() if x.dtype == torch.float16 else x
 
-
-@torch.no_grad()
-def position_encoding(roi: Tensor, embed: Tensor, max_temperature=128):
-    assert roi.size(-1) == 4
-    num_feats = embed.size(-1) // 4
-    roi = roi * math.pi
-    dim_t = torch.linspace(
-        0, math.log(max_temperature), num_feats, dtype=roi.dtype, device=roi.device
-    )
-    dim_t = dim_t.exp().view(1, 1, 1, -1)
-    pos_x = roi[..., None] * dim_t
-    pos_x = torch.cat(
-        (
-            pos_x[..., 0::2].sin() ,
-            pos_x[..., 1::2].cos() ,
-        ),
-        dim=3,
-    ).flatten(2)
-    return pos_x
 
 
 @torch.no_grad()
