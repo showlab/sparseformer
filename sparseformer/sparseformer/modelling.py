@@ -26,13 +26,13 @@ LAYER_NORM = partial(nn.LayerNorm, eps=1e-6)
 class OP(Enum):
     ATTN = 1
     MLP = 2
-    SAM = 3
-    ADJ = 4
-    PE_INJ = 5
+    SAMPLING_M = 3
+    ROI_ADJ = 4
+    PE_INJECT = 5
 
 DEFAULT_OPS_LIST = \
-[[OP.ATTN, OP.ADJ, OP.SAM, OP.MLP]] + \
-[[OP.ATTN, OP.ADJ, OP.SAM, OP.MLP]] + \
+[[OP.ATTN, OP.ROI_ADJ, OP.SAMPLING_M, OP.MLP]] + \
+[[OP.ATTN, OP.ROI_ADJ, OP.SAMPLING_M, OP.MLP]] + \
 [[OP.ATTN, OP.MLP]] * 7
 
 
@@ -244,7 +244,6 @@ class SFUnit(nn.Module):
         img_feat_dim,
         ops=[OP.ATTN, OP.MLP],
         num_sampling_points=36,
-        num_attn_heads=64,
         mlp_ratio=4,
         repeats=1,
         drop_path=0.0,
@@ -260,7 +259,7 @@ class SFUnit(nn.Module):
         self.repeats = repeats
         self.compatible_config = compatible_config
 
-        if OP.SAM in ops:
+        if OP.SAMPLING_M in ops:
             self.adaptive_mixing = AdaptiveMixing(
                 img_feat_dim, num_sampling_points, query_dim=dim, out_query_dim=dim,
                 pg_inner_dim=compatible_config.pg_inner_dim,
@@ -280,6 +279,7 @@ class SFUnit(nn.Module):
 
 
         if OP.ATTN in ops:
+            num_attn_heads = 64 if compatible_config.type_num_attn_heads == 1 else dim//64
             self.norm1 = norm_layer(dim)
             self.attn = Attention(
                 dim,
@@ -292,7 +292,7 @@ class SFUnit(nn.Module):
             self.mlp = Mlp(dim, hidden_features=dim*mlp_ratio)
 
 
-        if OP.ADJ in ops:
+        if OP.ROI_ADJ in ops:
             type_op_adjust = compatible_config.type_op_adjust
             if type_op_adjust == 1:
                 self.roi_adjust_module = nn.Sequential(
@@ -307,7 +307,7 @@ class SFUnit(nn.Module):
                     nn.Linear(dim, 4, bias=False),
                 )
 
-        if OP.PE_INJ in ops:
+        if OP.PE_INJECT in ops:
             self.pe_transition = nn.Sequential(
                 norm_layer(dim),
                 nn.Linear(dim, dim),
@@ -325,27 +325,31 @@ class SFUnit(nn.Module):
         if OP.ATTN in ops:
             init_linear_params(self.attn.qkv.weight, self.attn.qkv.bias)
 
-        if OP.ADJ in ops:
+        if OP.ROI_ADJ in ops:
             init_layer_norm_unit_norm(self.roi_adjust_module[0],  1.)
             nn.init.zeros_(self.roi_adjust_module[-1].weight)
             pass
 
-        if OP.SAM in ops:
+        if OP.SAMPLING_M in ops:
             init_layer_norm_unit_norm(self.roi_offset_module[0],  1.)
             nn.init.zeros_(self.roi_offset_module[-1].weight)
 
             root = int(self.num_sampling_points**0.5)
-            x = torch.linspace(0.5/root, 1-0.5/root, root)\
-                .view(1, -1, 1).repeat(root, 1, 1)
-            y = torch.linspace(0.5/root, 1-0.5/root, root)\
-                .view(-1, 1, 1).repeat(1, root, 1)
-            grid = torch.cat([x, y], dim=-1).view(root**2, -1)
-            bias = self.roi_offset_bias.view(-1, 2)
-            bias.data[:root**2] = grid - 0.5
+            sampling_points = self.roi_offset_bias.view(-1, 2)
+            if root ** 2 == self.num_sampling_points:
+                x = torch.linspace(0.5/root, 1-0.5/root, root)\
+                    .view(1, -1, 1).repeat(root, 1, 1)
+                y = torch.linspace(0.5/root, 1-0.5/root, root)\
+                    .view(-1, 1, 1).repeat(1, root, 1)
+                grid = torch.cat([x, y], dim=-1).view(root**2, -1)
+                sampling_points.data[:] = grid - 0.5
+            else:
+                nn.init.uniform_(sampling_points, -0.5, 0.5)
 
     def shift_token_roi(self, inp: Tensor, roi: Tensor):
         logit = self.roi_adjust_module(inp)
-        logit = self.dropout(logit)
+        if self.compatible_config.type_op_adjust == 1:
+            logit = self.dropout(logit)
         roi = roi_adjust(roi, logit)
         return roi
 
@@ -372,7 +376,6 @@ class SFUnit(nn.Module):
         src = self.adaptive_mixing(sampled_feat, inp)
         src = self.dropout(src)
         inp = inp + src
-
         return inp
 
 
@@ -390,11 +393,13 @@ class SFUnit(nn.Module):
         inp = inp + src
         return inp
 
-    def forward_inner(self,
-                      img_feat: Tensor,
-                      embed: Tensor,
-                      roi: Tensor,
-                      drop_path=None,):
+    def forward_inner(
+            self,
+            img_feat: Tensor,
+            embed: Tensor,
+            roi: Tensor,
+            drop_path=None
+    ):
         if drop_path is not None:
             self.dropout.drop_prob = drop_path
 
@@ -403,22 +408,24 @@ class SFUnit(nn.Module):
                 embed = self.attn_forward(embed)
             elif op == OP.MLP:
                 embed = self.mlp_forward(embed)
-            elif op == OP.ADJ:
+            elif op == OP.ROI_ADJ:
                 roi = self.shift_token_roi(embed, roi)
-            elif op == OP.SAM:
+            elif op == OP.SAMPLING_M:
                 embed = self.sampling_mixing(img_feat, embed, roi)
-            elif op == OP.PE_INJ:
+            elif op == OP.PE_INJECT:
                 pe = self.pe_transition(position_encoding(roi, embed))
                 embed = embed + pe
 
 
         return embed, roi
 
-    def forward(self,
-                img_feat: Tensor,
-                token_embedding: Tensor,
-                token_roi: Tensor,
-                drop_path=None,):
+    def forward(
+            self,
+            img_feat: Tensor,
+            token_embedding: Tensor,
+            token_roi: Tensor,
+            drop_path=None,
+    ):
         for i in range(self.repeats):
             drop_path = self.drop_path
             drop_path_item = drop_path if isinstance(
@@ -435,10 +442,10 @@ class SFUnit(nn.Module):
 
 class Head(nn.Module):
     def __init__(self,
-        in_dim,
-        num_classes=1000,
-        norm_layer=nn.LayerNorm,
-        op="avg",
+            in_dim,
+            num_classes=1000,
+            norm_layer=nn.LayerNorm,
+            op="avg",
     ):
         super(Head, self).__init__()
         self.in_dim = in_dim
@@ -478,19 +485,19 @@ class EarlyConvolution(nn.Module):
 
 class SparseFormer(nn.Module):
     def __init__(
-        self,
-        conv_dim=96,
-        num_latent_tokens=49,
-        same_token_embedding=False,
-        cls_token_insert_layer=-1,
-        num_sampling_points=36,
-        width_configs=[256,]+[512,]*8,
-        repeats=[4,]+[1,]*8,
-        drop_path_rate=0.2,
-        ops_list=None,
-        norm_layer=nn.LayerNorm,
-        head_op="avg",
-        compatible_config: CompatibleAttrDict=None,
+            self,
+            conv_dim=96,
+            num_latent_tokens=49,
+            same_token_embedding=True,
+            cls_token_insert_layer=-1,
+            num_sampling_points=36,
+            width_configs=[256,]+[512,]*8,
+            repeats=[4,]+[1,]*8,
+            drop_path_rate=0.2,
+            ops_list=None,
+            norm_layer=nn.LayerNorm,
+            head_op="avg",
+            compatible_config: CompatibleAttrDict=None,
     ):
         super(SparseFormer, self).__init__()
         self.num_latent_tokens = num_latent_tokens
@@ -548,6 +555,7 @@ class SparseFormer(nn.Module):
                 ops=ops,
                 compatible_config=compatible_config
             )
+
             self.layers.append(module)
             block_wise_idx += repeat
         
@@ -577,7 +585,7 @@ class SparseFormer(nn.Module):
     def _batchify(self, x: Tensor, batch_size: int):
         return x.unsqueeze(0).repeat(batch_size, 1, 1)
 
-    def _expand_if_necessary(self, x: Tensor):
+    def _expand_tokens(self, x: Tensor):
         return x if x.size(1) == self.num_latent_tokens else x.repeat(1, self.num_latent_tokens, 1)
 
     @torch.no_grad()
@@ -609,9 +617,9 @@ class SparseFormer(nn.Module):
         img_feat = _maybe_promote(img_feat)
 
         token_embedding = self._batchify(self.initial_embedding.weight, batch_size)
-        token_embedding = self._expand_if_necessary(token_embedding)
+        token_embedding = self._expand_tokens(token_embedding)
         token_roi = self._batchify(self.initial_roi.weight, batch_size)
-        token_roi = self._expand_if_necessary(token_roi)
+        token_roi = self._expand_tokens(token_roi)
 
         token_embedding = _maybe_promote(token_embedding)
         token_roi = _maybe_promote(token_roi)

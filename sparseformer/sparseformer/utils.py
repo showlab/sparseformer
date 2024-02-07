@@ -15,11 +15,12 @@ class AttrDict(dict):
 class CompatibleAttrDict(AttrDict):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.type_op_adjust = 1
-        self.restrict_grad_norm = True
+        self.type_num_attn_heads = 2
+        self.type_op_adjust = 2
+        self.restrict_grad_norm = False
         self.pg_inner_dim = .25
-        self.transition_ln = True
-        self.mixing_bias = True
+        self.transition_ln = False
+        self.mixing_bias = False
         self.update(**kwargs)
 
 def _maybe_promote(x: Tensor) -> Tensor:
@@ -75,15 +76,6 @@ def drop_path(x, drop_prob: float = 0.0, training: bool = False, batch_first=Fal
     See discussion: https://github.com/tensorflow/tpu/issues/494#issuecomment-532968956 ... I've opted for
     changing the layer and argument names to 'drop path' rather than mix DropConnect as a layer name and use
     'survival rate' as the argument.
-
-    ** IMPORTANT **
-    Modified (Jun. 16, by Ziteng Gao):
-    since we use the second dimension as the batch dimension, the random tensor shape is
-    actually `(1, x.shape[1],) + (1,) * (x.ndim - 2)` (not the originally `(x.shape[0],)
-    +(1,) * (x.ndim - 2)` in timm).
-    Sorry for this bug since I simply adopted timm code in the code reorganization
-    without further investigation.
-    ** This corrected version aligns with the paper **
     """
     if drop_prob == 0.0 or not training:
         return x
