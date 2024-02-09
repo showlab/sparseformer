@@ -54,13 +54,14 @@ def make_absolute_sampling_point(
         token_roi: Tensor,
         sampling_offset: Tensor,
         num_heads: int,
-        num_points: int) -> Tensor:
+        num_points: int,
+        eps=1e-5) -> Tensor:
     batch, num_tokens, _ = sampling_offset.shape
 
     sampling_offset = sampling_offset.view(batch, num_tokens, 1, num_heads*num_points, 2)
 
     offset_mean = sampling_offset.mean(-2, keepdim=True)
-    offset_std = sampling_offset.std(-2, keepdim=True)+1e-7
+    offset_std = sampling_offset.std(-2, keepdim=True)+eps
     sampling_offset = (sampling_offset - offset_mean)/(3*offset_std)
 
     token_roi_xy = (token_roi[:, :, 2:]+token_roi[:, :, :2])/2.0
@@ -76,7 +77,8 @@ def sampling_from_img_feat(
         sampling_point: Tensor,
         img_feat: Tensor,
         n_points: int,
-        restrict_grad_norm: bool = True,
+        restrict_grad_norm:bool=True,
+        grid_sample_config:dict=None
     ):
     batch, Hq, Wq, num_points_per_head, _ = sampling_point.shape
     batch, channel, height, width = img_feat.shape
@@ -95,9 +97,11 @@ def sampling_from_img_feat(
     sampling_point = sampling_point.flatten(2, 3)
     sampling_point = sampling_point*2.0-1.0
     img_feat = img_feat.view(batch*n_heads, channel//n_heads, height, width)
+
+    grid_sample_config = dict(mode="bilinear", padding_mode="border", align_corners=False) if grid_sample_config is None else grid_sample_config
     out = F.grid_sample(
         img_feat, sampling_point,
-        mode='bilinear', padding_mode='zeros', align_corners=False,
+        **grid_sample_config
     )
 
     out = out.view(batch, n_heads, channel//n_heads, Hq, Wq, n_points)
@@ -124,11 +128,16 @@ def position_encoding(roi: Tensor, embed: Tensor, max_temperature=128):
     return pos_x
 
 @autocast(enabled=False)
-def layer_norm_by_dim(x: Tensor, dim: int=-1):
-    mean = x.mean(dim, keepdim=True)
-    x = x - mean
-    std = (x.var(dim=dim, keepdim=True)+1e-7).sqrt()
-    return x / std
+def layer_norm_by_dim(x: Tensor, dim: int=-1, eps=1e-5):
+    var, mean = torch.var_mean(x, dim=dim, unbiased=False, keepdim=True)
+    return (x - mean) / (var + eps).sqrt()
+
+
+class QuickGELU(nn.Module):
+    # NOTE borrowed from openclip
+    # NOTE This is slower than nn.GELU or nn.SiLU and uses more GPU memory
+    def forward(self, x: torch.Tensor):
+        return x * torch.sigmoid(1.702 * x)
 
 
 class AdaptiveMixing(nn.Module):
@@ -259,6 +268,14 @@ class SFUnit(nn.Module):
         self.repeats = repeats
         self.compatible_config = compatible_config
 
+        if compatible_config.use_stage_embedding and repeats > 1:
+            self.stage_embedding = nn.Embedding(repeats, dim)
+        else:
+            self.stage_embedding = None
+
+        mlp_act_layer = QuickGELU if (repeats == 1) and compatible_config.clip_quick_gelu else nn.GELU
+
+
         if OP.SAMPLING_M in ops:
             self.adaptive_mixing = AdaptiveMixing(
                 img_feat_dim, num_sampling_points, query_dim=dim, out_query_dim=dim,
@@ -289,7 +306,7 @@ class SFUnit(nn.Module):
 
         if OP.MLP in ops:
             self.norm2 = norm_layer(dim)
-            self.mlp = Mlp(dim, hidden_features=dim*mlp_ratio)
+            self.mlp = Mlp(dim, hidden_features=dim*mlp_ratio, act_layer=mlp_act_layer)
 
 
         if OP.ROI_ADJ in ops:
@@ -371,6 +388,7 @@ class SFUnit(nn.Module):
             img_feat,
             n_points=self.num_sampling_points,
             restrict_grad_norm=self.compatible_config.restrict_grad_norm if self.compatible_config else True,
+            grid_sample_config=self.compatible_config.grid_sample_config
         )
 
         src = self.adaptive_mixing(sampled_feat, inp)
@@ -427,6 +445,8 @@ class SFUnit(nn.Module):
             drop_path=None,
     ):
         for i in range(self.repeats):
+            if self.stage_embedding is not None:
+                token_embedding = token_embedding + self.stage_embedding.weight[i].reshape(1, 1, -1)
             drop_path = self.drop_path
             drop_path_item = drop_path if isinstance(
                 drop_path, float) else drop_path[i]
@@ -442,24 +462,17 @@ class SFUnit(nn.Module):
 
 class Head(nn.Module):
     def __init__(self,
-            in_dim,
-            num_classes=1000,
-            norm_layer=nn.LayerNorm,
             op="avg",
     ):
         super(Head, self).__init__()
-        self.in_dim = in_dim
-        self.num_classes = num_classes
         self.op = op
-        self.norm = norm_layer(in_dim)
-        self.classifier = nn.Linear(in_dim, num_classes)
 
     def forward(self, x):
         if self.op == "avg":
             x = x.mean(1)
         elif self.op == "cls":
             x = x[:, 0]
-        return self.classifier(self.norm(x))
+        return x
 
 
 class EarlyConvolution(nn.Module):
@@ -493,10 +506,11 @@ class SparseFormer(nn.Module):
             num_sampling_points=36,
             width_configs=[256,]+[512,]*8,
             repeats=[4,]+[1,]*8,
-            drop_path_rate=0.2,
+            drop_path_rate=0.,
             ops_list=None,
-            norm_layer=nn.LayerNorm,
             head_op="avg",
+            proj_dim=1000,
+            proj_bias=True,
             compatible_config: CompatibleAttrDict=None,
     ):
         super(SparseFormer, self).__init__()
@@ -505,6 +519,7 @@ class SparseFormer(nn.Module):
         self.repeats = repeats
 
         compatible_config = CompatibleAttrDict() if compatible_config is None else compatible_config
+        norm_layer = partial(nn.LayerNorm, eps=compatible_config.ln_eps)
         ops_list = DEFAULT_OPS_LIST if ops_list is None else ops_list
 
         self.feat_extractor = EarlyConvolution(conv_dim=conv_dim)
@@ -559,7 +574,9 @@ class SparseFormer(nn.Module):
             self.layers.append(module)
             block_wise_idx += repeat
         
-        self.head = Head(end_dim, norm_layer=norm_layer, op=head_op)
+        self.head = Head(op=head_op)
+        self.norm = norm_layer(end_dim)
+        self.proj = nn.Linear(end_dim, proj_dim, bias=proj_bias)
 
         self.srnet_init()
 
@@ -609,20 +626,21 @@ class SparseFormer(nn.Module):
         root = int(self.num_latent_tokens**0.5)
         init_rois_to_grid(root, 0, 0.5)
 
-    def forward(self, x: Tensor, return_embedding_and_roi: bool = False, scale=1.):
+    def forward(self, x: Tensor, scale=1., prompte_type=True):
         RestrictGradNorm.GRAD_SCALE = scale
         batch_size = x.size(0)
 
         img_feat = self.feat_extractor(x)
-        img_feat = _maybe_promote(img_feat)
 
         token_embedding = self._batchify(self.initial_embedding.weight, batch_size)
         token_embedding = self._expand_tokens(token_embedding)
         token_roi = self._batchify(self.initial_roi.weight, batch_size)
         token_roi = self._expand_tokens(token_roi)
 
-        token_embedding = _maybe_promote(token_embedding)
-        token_roi = _maybe_promote(token_roi)
+        if prompte_type:
+            img_feat = _maybe_promote(img_feat)
+            token_embedding = _maybe_promote(token_embedding)
+            token_roi = _maybe_promote(token_roi)
 
         layer_idx = 0
         for layer in self.layers:
@@ -635,8 +653,8 @@ class SparseFormer(nn.Module):
             else:
                 token_embedding = layer(token_embedding)
 
-        if return_embedding_and_roi:
-            return self.head.norm(token_embedding), token_roi
-        else:
-            return self.head(token_embedding)
+        final = self.head(token_embedding)
+        final = self.norm(final)
+        final = self.proj(final)
 
+        return final

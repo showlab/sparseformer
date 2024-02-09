@@ -21,6 +21,10 @@ class CompatibleAttrDict(AttrDict):
         self.pg_inner_dim = .25
         self.transition_ln = False
         self.mixing_bias = False
+        self.ln_eps = 1e-5
+        self.use_stage_embedding = True
+        self.clip_quick_gelu = False
+        self.grid_sample_config = dict(mode="bilinear", padding_mode="border", align_corners=False)
         self.update(**kwargs)
 
 def _maybe_promote(x: Tensor) -> Tensor:
