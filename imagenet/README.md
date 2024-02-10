@@ -15,7 +15,8 @@ You can start training our SparseFormer on ImageNet-1K with make targets in [Mak
 ### AMP Caveats
 Now we support automatic mixed precision (AMP) training with `torch.autocast`! Specify AMP_OPT_LEVEL=A to enable it. In case of your own training loop, please pass grad scale into the forward method of Sparseformer, like `outputs = model(samples, scale=scaler.get_scale())`. We have tested it on SparseFormer-T and the accuracy is matched.
 
-~~Till now, we have not yet support mixed precision training of SparseFormer models but it is a planned feature.~~
+## Credits
+The image SparseFormer codebase is heavily based on [Swin codebase](https://github.com/microsoft/Swin-Transformer). A big thank for their great work.
 
 ### Install
 (based on the original Swin [getting_started.md](https://github.com/microsoft/Swin-Transformer/blob/main/get_started.md))
