@@ -1,7 +1,7 @@
 # 🎆 SparseFormer
 This is the offical repo for SparseFormer researches:
 
-> [**SparseFormer: Sparse Visual Recognition via Limited Latent Tokens**](https://arxiv.org/abs/2304.03768)<br>
+> [**SparseFormer: Sparse Visual Recognition via Limited Latent Tokens**](https://arxiv.org/abs/2304.03768) **(ICLR 2024)**<br>
 > Ziteng Gao, Zhan Tong, Limin Wang, Mike Zheng Shou<br>
 
 > [**Bootstrapping SparseFormers from Vision Foundation Models**](https://arxiv.org/abs/2312.01987)<br>
@@ -53,5 +53,14 @@ If you find SparseFormer useful in your research or work, please consider citing
     eprint={2304.03768},
     archivePrefix={arXiv},
     primaryClass={cs.CV}
+}
+
+@misc{gao2023bootstrapping,
+      title={Bootstrapping SparseFormers from Vision Foundation Models}, 
+      author={Ziteng Gao and Zhan Tong and Kevin Qinghong Lin and Joya Chen and Mike Zheng Shou},
+      year={2023},
+      eprint={2312.01987},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV}
 }
 ```
