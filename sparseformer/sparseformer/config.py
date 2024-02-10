@@ -1,6 +1,10 @@
 from .modelling import OP
 from .utils import CompatibleAttrDict
 
+from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, \
+                                IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD, \
+                                OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
+
 def route_name_to_config(model_type: str):
     model_type = model_type.lower()
     global_dict = globals()
@@ -90,6 +94,7 @@ def sparseformer_v1_tiny(num_latent_tokens=49):
         proj_dim=1000,
         proj_bias=True,
         drop_path_rate=0.2,
+        normalization_factor=(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
     )
     return config
 
@@ -104,7 +109,8 @@ def sparseformer_v1_small(num_latent_tokens=64):
         compatible_config=make_v1_attr(),
         proj_dim=1000,
         proj_bias=True,
-        drop_path_rate=0.3
+        drop_path_rate=0.3,
+        normalization_factor=(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
     )
     return config
 
@@ -119,7 +125,8 @@ def sparseformer_v1_base(num_latent_tokens=81):
         compatible_config=make_v1_attr(),
         proj_dim=1000,
         proj_bias=True,
-        drop_path_rate=0.4
+        drop_path_rate=0.4,
+        normalization_factor=(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
     )
     return config
     
@@ -134,6 +141,7 @@ def sparseformer_btsp_augreg_base(num_latent_tokens=49):
         compatible_config=make_btsp_attr(),
         proj_dim=1000,
         proj_bias=True,
+        normalization_factor=(IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD),
     )
     return config
 
@@ -148,6 +156,7 @@ def sparseformer_btsp_augreg_large(num_latent_tokens=49):
         compatible_config=make_btsp_attr(),
         proj_dim=1000,
         proj_bias=True,
+        normalization_factor=(IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD),
     )
     return config
 
@@ -162,6 +171,7 @@ def sparseformer_btsp_openai_clip_base(num_latent_tokens=49):
         compatible_config=make_clip_attr(),
         proj_dim=512,
         proj_bias=False,
+        normalization_factor=(OPENAI_CLIP_MEAN, OPENAI_CLIP_STD),
     )
     return config
 
@@ -176,5 +186,6 @@ def sparseformer_btsp_openai_clip_large(num_latent_tokens=64):
         compatible_config=make_clip_attr(),
         proj_dim=768,
         proj_bias=False,
+        normalization_factor=(OPENAI_CLIP_MEAN, OPENAI_CLIP_STD),
     )
     return config

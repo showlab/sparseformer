@@ -512,6 +512,8 @@ class SparseFormer(nn.Module):
             proj_dim=1000,
             proj_bias=True,
             compatible_config: CompatibleAttrDict=None,
+            *args,
+            **kwargs,
     ):
         super(SparseFormer, self).__init__()
         self.num_latent_tokens = num_latent_tokens
