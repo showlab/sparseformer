@@ -41,7 +41,8 @@ def create_model(model_type, pretrained=None, download=False, cache_dir="./ckpts
         assert model_type in MODEL_CKPT_URLS
         os.makedirs(cache_dir, exist_ok=True)
         pretrained = f"{cache_dir}/{model_type}.pth"
-        urllib.request.urlretrieve(MODEL_CKPT_URLS[model_type], pretrained)
+        if not os.path.exists(pretrained):
+            urllib.request.urlretrieve(MODEL_CKPT_URLS[model_type], pretrained)
 
     if pretrained:
         state_dict = torch.load(pretrained, map_location="cpu")
