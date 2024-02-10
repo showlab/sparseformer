@@ -34,7 +34,8 @@ def create_preprocessing(resize, crop, mean, std):
     )
 
 
-def create_model(model_type, pretrained=None, download=False, cache_dir="./ckpts/", return_only_model=True):
+def create_model(model_type: str, pretrained=None, download=False, cache_dir="./ckpts/", return_only_model=True):
+    model_type = model_type.lower()
     config = route_name_to_config(model_type)
 
     if download:
