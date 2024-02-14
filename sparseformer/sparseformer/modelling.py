@@ -106,7 +106,7 @@ def sampling_from_img_feat(
 
     out = out.view(batch, n_heads, channel//n_heads, Hq, Wq, n_points)
 
-    return out.permute(0, 3, 4, 1, 5, 2).flatten(1, 2)
+    return out.permute(0, 3, 4, 1, 5, 2).flatten(1, 2) # [B, n_tokens, 1, n_points, channels]
 
 @torch.no_grad()
 def position_encoding(roi: Tensor, embed: Tensor, max_temperature=128):
@@ -258,6 +258,7 @@ class SFUnit(nn.Module):
         drop_path=0.0,
         norm_layer=nn.LayerNorm,
         compatible_config: CompatibleAttrDict = None,
+        sampling_ops = None,
     ):
         super(SFUnit, self).__init__()
 
@@ -274,6 +275,15 @@ class SFUnit(nn.Module):
             self.stage_embedding = None
 
         mlp_act_layer = QuickGELU if (repeats == 1) and compatible_config.clip_quick_gelu else nn.GELU
+
+        sampling_ops = [roi_adjust, make_absolute_sampling_point, sampling_from_img_feat, position_encoding] if sampling_ops is None else sampling_ops
+
+        self.sampling_ops = sampling_ops
+
+        self.op_roi_adjust = sampling_ops[0]
+        self.op_make_absolute_sampling_point = sampling_ops[1]
+        self.op_sampling_from_img_feat = sampling_ops[2]
+        self.op_position_encoding = sampling_ops[3]
 
 
         if OP.SAMPLING_M in ops:
@@ -367,7 +377,7 @@ class SFUnit(nn.Module):
         logit = self.roi_adjust_module(inp)
         if self.compatible_config.type_op_adjust == 1:
             logit = self.dropout(logit)
-        roi = roi_adjust(roi, logit)
+        roi = self.op_roi_adjust(roi, logit)
         return roi
 
     def sampling_mixing(self, img_feat: Tensor, inp: Tensor, roi: Tensor):
@@ -376,14 +386,14 @@ class SFUnit(nn.Module):
             inp.size(0), inp.size(1), 1)
         sampling_offset = sampling_offset_base + sampling_offset_adaptive
 
-        sampling_point = make_absolute_sampling_point(
+        sampling_point = self.op_make_absolute_sampling_point(
             roi,
             sampling_offset,
             1,
             self.num_sampling_points
         )
 
-        sampled_feat = sampling_from_img_feat(
+        sampled_feat = self.op_sampling_from_img_feat(
             sampling_point,
             img_feat,
             n_points=self.num_sampling_points,
@@ -431,7 +441,7 @@ class SFUnit(nn.Module):
             elif op == OP.SAMPLING_M:
                 embed = self.sampling_mixing(img_feat, embed, roi)
             elif op == OP.PE_INJECT:
-                pe = self.pe_transition(position_encoding(roi, embed))
+                pe = self.pe_transition(self.op_position_encoding(roi, embed))
                 embed = embed + pe
 
 
@@ -512,6 +522,8 @@ class SparseFormer(nn.Module):
             proj_dim=1000,
             proj_bias=True,
             compatible_config: CompatibleAttrDict=None,
+            sampling_ops=None,
+            debug_returns=None,
             *args,
             **kwargs,
     ):
@@ -519,6 +531,8 @@ class SparseFormer(nn.Module):
         self.num_latent_tokens = num_latent_tokens
         self.width_configurations = width_configs
         self.repeats = repeats
+        self.debug_returns = debug_returns
+        self.embed_dim = width_configs[-1]
 
         compatible_config = CompatibleAttrDict() if compatible_config is None else compatible_config
         norm_layer = partial(nn.LayerNorm, eps=compatible_config.ln_eps)
@@ -570,7 +584,8 @@ class SparseFormer(nn.Module):
                 drop_path=lin_drop_path[block_wise_idx:block_wise_idx+repeat],
                 norm_layer=norm_layer,
                 ops=ops,
-                compatible_config=compatible_config
+                compatible_config=compatible_config,
+                sampling_ops=sampling_ops
             )
 
             self.layers.append(module)
@@ -645,12 +660,16 @@ class SparseFormer(nn.Module):
             token_roi = _maybe_promote(token_roi)
 
         layer_idx = 0
+        hidden_embeddings = []
+        hidden_rois = []
         for layer in self.layers:
             if isinstance(layer, SFUnit):
                 if layer_idx == self.cls_token_insert_idx:
                     cls_embedding = self._batchify(self.cls_embedding.weight, batch_size)
                     token_embedding = torch.cat([cls_embedding, token_embedding], dim=1)
                 token_embedding, token_roi = layer(img_feat, token_embedding, token_roi)
+                # hidden_embeddings.append(self.norm(token_embedding))
+                hidden_rois.append(token_roi)
                 layer_idx += 1
             else:
                 token_embedding = layer(token_embedding)
@@ -659,4 +678,13 @@ class SparseFormer(nn.Module):
         final = self.norm(final)
         final = self.proj(final)
 
-        return final
+        if self.debug_returns:
+            return dict(
+                token_embedding=self.norm(token_embedding),
+                token_roi=token_roi,
+                hidden_rois=hidden_rois,
+                hidden_embeddings=hidden_embeddings,
+            )
+        else:
+            return final
+
