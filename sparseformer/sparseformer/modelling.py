@@ -80,6 +80,8 @@ def sampling_from_img_feat(
         restrict_grad_norm:bool=True,
         grid_sample_config:dict=None
     ):
+    assert sampling_point.dtype == torch.float and img_feat.dtype == torch.float
+
     batch, Hq, Wq, num_points_per_head, _ = sampling_point.shape
     batch, channel, height, width = img_feat.shape
 
@@ -111,10 +113,11 @@ def sampling_from_img_feat(
 @torch.no_grad()
 def position_encoding(roi: Tensor, embed: Tensor, max_temperature=128):
     assert roi.size(-1) == 4
+    roi = roi.type_as(embed)
     num_feats = embed.size(-1) // 4
     roi = roi * math.pi
     dim_t = torch.linspace(
-        0, math.log(max_temperature), num_feats, dtype=roi.dtype, device=roi.device
+        0, math.log(max_temperature), num_feats, dtype=embed.dtype, device=embed.device
     )
     dim_t = dim_t.exp().view(1, 1, 1, -1)
     pos_x = roi[..., None] * dim_t
@@ -397,11 +400,11 @@ class SFUnit(nn.Module):
             sampling_point,
             img_feat,
             n_points=self.num_sampling_points,
-            restrict_grad_norm=self.compatible_config.restrict_grad_norm if self.compatible_config else True,
+            restrict_grad_norm=self.compatible_config.restrict_grad_norm,
             grid_sample_config=self.compatible_config.grid_sample_config
         )
 
-        src = self.adaptive_mixing(sampled_feat, inp)
+        src = self.adaptive_mixing(sampled_feat.type_as(inp), inp)
         src = self.dropout(src)
         inp = inp + src
         return inp
@@ -522,6 +525,7 @@ class SparseFormer(nn.Module):
             proj_dim=1000,
             proj_bias=True,
             compatible_config: CompatibleAttrDict=None,
+            feat_extractor=None,
             sampling_ops=None,
             debug_returns=None,
             *args,
@@ -538,7 +542,8 @@ class SparseFormer(nn.Module):
         norm_layer = partial(nn.LayerNorm, eps=compatible_config.ln_eps)
         ops_list = DEFAULT_OPS_LIST if ops_list is None else ops_list
 
-        self.feat_extractor = EarlyConvolution(conv_dim=conv_dim)
+        feat_extractor = EarlyConvolution if feat_extractor is None else feat_extractor
+        self.feat_extractor = feat_extractor(conv_dim)
 
         start_dim = width_configs[0]
         end_dim = width_configs[-1]
@@ -655,9 +660,8 @@ class SparseFormer(nn.Module):
         token_roi = self._expand_tokens(token_roi)
 
         if prompte_type:
-            img_feat = _maybe_promote(img_feat)
-            token_embedding = _maybe_promote(token_embedding)
-            token_roi = _maybe_promote(token_roi)
+            img_feat = img_feat.float()
+            token_roi = token_roi.float()
 
         layer_idx = 0
         hidden_embeddings = []
@@ -668,7 +672,7 @@ class SparseFormer(nn.Module):
                     cls_embedding = self._batchify(self.cls_embedding.weight, batch_size)
                     token_embedding = torch.cat([cls_embedding, token_embedding], dim=1)
                 token_embedding, token_roi = layer(img_feat, token_embedding, token_roi)
-                # hidden_embeddings.append(self.norm(token_embedding))
+                hidden_embeddings.append(token_embedding)
                 hidden_rois.append(token_roi)
                 layer_idx += 1
             else:

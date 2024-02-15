@@ -35,6 +35,7 @@ def make_v1_attr():
         type_op_adjust=1,
         mixing_bias=True,
         transition_ln=True,
+        restrict_grad_norm=True,
         ln_eps=1e-6,
         use_stage_embedding=False,
         grid_sample_config=dict(mode="bilinear", padding_mode="zeros", align_corners=False)

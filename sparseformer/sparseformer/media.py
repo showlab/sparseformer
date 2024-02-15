@@ -56,6 +56,8 @@ def sampling_from_img_feat_3d(
         restrict_grad_norm:bool=True,
         grid_sample_config:dict=None
     ):
+    assert sampling_point.dtype == torch.float and img_feat.dtype == torch.float
+
     batch, n_tokens, one, n_points, three = sampling_point.shape
     assert one == 1 and three == 3
     batch, channel, temporal, height, width = img_feat.shape
@@ -115,7 +117,6 @@ class MediaSparseFormer(SparseFormer):
         if self.initial_embedding.weight.size(0) != 1:
             self.initial_embedding = nn.Embedding(self.num_latent_tokens, self.width_configurations[0])
 
-        # subtitle Conv2d and Maxpool2d
         conv1 = self.feat_extractor.conv1
         maxpool = self.feat_extractor.maxpool
 
