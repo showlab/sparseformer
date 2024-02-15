@@ -82,13 +82,12 @@ def sampling_from_img_feat(
     ):
     assert sampling_point.dtype == torch.float and img_feat.dtype == torch.float
 
-    batch, Hq, Wq, num_points_per_head, _ = sampling_point.shape
+    batch, n_tokens, one, n_points, two = sampling_point.shape
+    assert one == 1 and two == 2
     batch, channel, height, width = img_feat.shape
 
-    n_heads = num_points_per_head//n_points
 
-    sampling_point = sampling_point.view(batch, Hq, Wq, n_heads, n_points, 2) \
-        .permute(0, 3, 1, 2, 4, 5).contiguous().flatten(0, 1)
+    sampling_point = sampling_point.reshape(batch, n_tokens, n_points, 2)
 
     if restrict_grad_norm:
         # We truncate the grad for sampling coordinates to the unit length (e.g., 1.0/height)
@@ -96,19 +95,19 @@ def sampling_from_img_feat(
         # gradients to be local.
         sampling_point = RestrictGradNorm.apply(sampling_point, 1.0/height)
 
-    sampling_point = sampling_point.flatten(2, 3)
     sampling_point = sampling_point*2.0-1.0
-    img_feat = img_feat.view(batch*n_heads, channel//n_heads, height, width)
+    img_feat = img_feat.view(batch, channel, height, width)
 
     grid_sample_config = dict(mode="bilinear", padding_mode="border", align_corners=False) if grid_sample_config is None else grid_sample_config
+
     out = F.grid_sample(
         img_feat, sampling_point,
         **grid_sample_config
     )
 
-    out = out.view(batch, n_heads, channel//n_heads, Hq, Wq, n_points)
+    out = out.reshape(batch, channel, n_tokens, n_points)
 
-    return out.permute(0, 3, 4, 1, 5, 2).flatten(1, 2) # [B, n_tokens, 1, n_points, channels]
+    return out.permute(0, 2, 3, 1).unsqueeze(2) # [B, n_tokens, 1, n_points, channels]
 
 @torch.no_grad()
 def position_encoding(roi: Tensor, embed: Tensor, max_temperature=128):

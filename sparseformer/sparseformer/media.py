@@ -63,7 +63,7 @@ def sampling_from_img_feat_3d(
     batch, channel, temporal, height, width = img_feat.shape
 
 
-    sampling_point = sampling_point.view(batch, 1, n_tokens, n_points, 3)
+    sampling_point = sampling_point.reshape(batch, 1, n_tokens, n_points, 3)
 
     sampling_point = sampling_point*2.0-1.0
     img_feat = img_feat.view(batch, channel, temporal, height, width)
@@ -75,7 +75,7 @@ def sampling_from_img_feat_3d(
         **grid_sample_config
     )
 
-    out = out.view(batch, channel, n_tokens, n_points)
+    out = out.reshape(batch, channel, n_tokens, n_points)
 
     return out.permute(0, 2, 3, 1).unsqueeze(2) # [B, n_tokens, 1, n_points, channels]
 
