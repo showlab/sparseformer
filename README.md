@@ -4,7 +4,7 @@ This is the offical repo for SparseFormer researches:
 > [**SparseFormer: Sparse Visual Recognition via Limited Latent Tokens**](https://arxiv.org/abs/2304.03768) **(ICLR 2024)**<br>
 > Ziteng Gao, Zhan Tong, Limin Wang, Mike Zheng Shou<br>
 
-> [**Bootstrapping SparseFormers from Vision Foundation Models**](https://arxiv.org/abs/2312.01987)<br>
+> [**Bootstrapping SparseFormers from Vision Foundation Models**](https://arxiv.org/abs/2312.01987) **(CVPR 2024)**<br>
 > Ziteng Gao, Zhan Tong, Kevin Qinghong Lin, Joya Chen, Mike Zheng Shou<br>
 
 
