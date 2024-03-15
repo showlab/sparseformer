@@ -24,7 +24,7 @@ from sparseformer.factory import create_model
 model = create_model("sparseformer_v1_tiny", download=True)
 
 
-# or make a Clip SparseFormer large model and put it in OpenClip pipeline
+# or make a CLIP SparseFormer large model and put it in OpenClip pipeline
 import open_clip
 clip = open_clip.create_model_and_transforms("ViT-L-14", "openai")
 visual = create_model("sparseformer_btsp_openai_clip_large", download=True)
