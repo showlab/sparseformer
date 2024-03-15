@@ -80,7 +80,8 @@ def sampling_from_img_feat_3d(
 
 @torch.no_grad()
 def position_encoding_3d(roi: Tensor, embed: Tensor, max_temperature=128):
-    # TODO add temporal PE
+    # TODO add compatible temporal PE for BTSP
+    # NOTE compatible for SFv1, which does not use PE
     return torch.zeros_like(embed)
     assert roi.size(-1) == 6
     num_feats = embed.size(-1) // 4
