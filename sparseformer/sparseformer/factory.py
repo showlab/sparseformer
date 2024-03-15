@@ -18,8 +18,8 @@ MODEL_CKPT_URLS = {
     "sparseformer_btsp_augreg_base": "https://github.com/showlab/sparseformer/releases/download/v2.0.0-refactor/sparseformer_btsp_augreg_base_converted.pth",
     "sparseformer_btsp_augreg_large": "https://github.com/showlab/sparseformer/releases/download/v2.0.0-refactor/sparseformer_btsp_augreg_large_converted.pth",
     # multimodal openai clip ones
-    "sparseformer_btsp_openai_clip_base": "https://github.com/showlab/sparseformer/releases/download/v2.0.0-refactor/sparseformer_btsp_clip_base_converted.pth",
-    "sparseformer_btsp_openai_clip_large": "https://github.com/showlab/sparseformer/releases/download/v2.0.0-refactor/sparseformer_btsp_clip_base_converted.pth",
+    "sparseformer_btsp_openai_clip_base": "https://github.com/showlab/sparseformer/releases/download/v2.0.0-refactor/sparseformer_btsp_openai_clip_base_converted.pth",
+    "sparseformer_btsp_openai_clip_large": "https://github.com/showlab/sparseformer/releases/download/v2.0.0-refactor/sparseformer_btsp_openai_clip_large_converted.pth",
 }
 
 
