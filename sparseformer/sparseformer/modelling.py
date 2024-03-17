@@ -267,7 +267,7 @@ class SFUnit(nn.Module):
 
         self.num_sampling_points = num_sampling_points
         self.repeats = repeats
-        self.compatible_config = compatible_config
+        self.compatible_config = compatible_config if compatible_config is not None else CompatibleAttrDict()
 
         if compatible_config.use_stage_embedding and repeats > 1:
             self.stage_embedding = nn.Embedding(repeats, dim)
