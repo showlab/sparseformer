@@ -45,7 +45,7 @@ Our codebase is generally compatible with [timm vision transformer](https://gith
 
 For example, you can make a SparseFormer similar to ViT-224/16 and with sampling & decoding and roi adjusting every 3 block, and load it with CLIP OpenAI official pre-trained weights:
 ```python
-from sparseformer.modelling import SparseFormer, OP
+from sparseformer.modeling import SparseFormer, OP
 from sparseformer.config import base_btsp_config
 
 ops_list = []
