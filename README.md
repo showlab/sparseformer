@@ -8,8 +8,8 @@ This is the offical repo for SparseFormer researches:
 > [**Bootstrapping SparseFormers from Vision Foundation Models**](https://arxiv.org/abs/2312.01987) **(CVPR 2024)**<br>
 > Ziteng Gao, Zhan Tong, Kevin Qinghong Lin, Joya Chen, Mike Zheng Shou<br>
 
-## TL;DR
-SparseFormer is a ViT with **less tokens and compute used**, which can also handle **any aspect ratio and resolution**.
+<!-- ## TL;DR
+SparseFormer is a ViT with **less tokens and compute used**, which can also handle **any aspect ratio and resolution**. -->
 
 ## Out-of-box SparseFormer as a Library (recommended)
 We provide the out-of-box SparseFormer usage with the sparseformer library installation. 

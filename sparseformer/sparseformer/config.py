@@ -1,4 +1,4 @@
-from .modelling import OP
+from .modeling import OP
 from .utils import CompatibleAttrDict
 
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, \

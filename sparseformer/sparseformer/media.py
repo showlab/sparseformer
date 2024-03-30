@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.cuda.amp import autocast
 
-from .modelling import SparseFormer
+from .modeling import SparseFormer
 
 
 

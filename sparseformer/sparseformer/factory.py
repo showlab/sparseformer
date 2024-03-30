@@ -5,7 +5,7 @@ import os
 import torchvision.transforms as T
 
 from .config import route_name_to_config
-from .modelling import SparseFormer
+from .modeling import SparseFormer
 
 
 MODEL_CKPT_URLS = {
