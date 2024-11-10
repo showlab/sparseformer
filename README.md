@@ -91,21 +91,27 @@ For training SparseFormer v1 in ImageNets ([**SparseFormer: Sparse Visual Recogn
 ## Citation
 If you find SparseFormer useful in your research or work, please consider citing us using the following entry:
 ```
-@misc{gao2023sparseformer,
-    title={SparseFormer: Sparse Visual Recognition via Limited Latent Tokens},
-    author={Ziteng Gao and Zhan Tong and Limin Wang and Mike Zheng Shou},
-    year={2023},
-    eprint={2304.03768},
-    archivePrefix={arXiv},
-    primaryClass={cs.CV}
+@inproceedings{gao2024sparseformer,
+  author       = {Ziteng Gao and
+                  Zhan Tong and
+                  Limin Wang and
+                  Mike Zheng Shou},
+  title        = {SparseFormer: Sparse Visual Recognition via Limited Latent Tokens},
+  booktitle    = {{ICLR}},
+  publisher    = {OpenReview.net},
+  year         = {2024}
 }
 
-@misc{gao2023bootstrapping,
-      title={Bootstrapping SparseFormers from Vision Foundation Models}, 
-      author={Ziteng Gao and Zhan Tong and Kevin Qinghong Lin and Joya Chen and Mike Zheng Shou},
-      year={2023},
-      eprint={2312.01987},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV}
+@inproceedings{gao2024bootstrapping,
+  author       = {Ziteng Gao and
+                  Zhan Tong and
+                  Kevin Qinghong Lin and
+                  Joya Chen and
+                  Mike Zheng Shou},
+  title        = {Bootstrapping SparseFormers from Vision Foundation Models},
+  booktitle    = {{CVPR}},
+  pages        = {17710--17721},
+  publisher    = {{IEEE}},
+  year         = {2024}
 }
 ```
